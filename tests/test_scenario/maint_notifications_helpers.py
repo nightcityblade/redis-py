@@ -172,6 +172,43 @@ class ClusterOperations:
             skip_end_notification=skip_end_notification,
         )
 
+    @staticmethod
+    def migrate(
+        fault_injector: FaultInjectorClient,
+        endpoint_config: Dict[str, Any],
+    ) -> str:
+        """Migrate all master shards of the database to another node.
+
+        Args:
+            fault_injector: The fault injector client to use
+            endpoint_config: Endpoint configuration dictionary
+
+        Returns:
+            str: Action ID for tracking the operation
+        """
+        return fault_injector.migrate(endpoint_config)
+
+    @staticmethod
+    def wait_for_database_active(
+        fault_injector: FaultInjectorClient,
+        endpoint_config: Dict[str, Any],
+        active_timeout: Optional[int] = None,
+    ) -> str:
+        """Wait server-side until the database reports 'active'.
+
+        Args:
+            fault_injector: The fault injector client to use
+            endpoint_config: Endpoint configuration dictionary
+            active_timeout: Optional seconds to wait before the fault injector
+                gives up (its own default applies when omitted)
+
+        Returns:
+            str: Action ID for tracking the operation
+        """
+        return fault_injector.wait_for_database_active(
+            endpoint_config, active_timeout=active_timeout
+        )
+
 
 class KeyGenerationHelpers:
     TOTAL_SLOTS = 16384
@@ -301,12 +338,16 @@ def generate_params(
     effect_names: list[SlotMigrateEffects | TopologyChangeStandaloneEffects],
     skip_combinations: list[tuple[SlotMigrateEffects, str]] = [],
     endpoint_types: Optional[list[EndpointType]] = None,
+    include_tls: bool = True,
 ):
     """Build parametrize tuples for maint-notification scenario tests.
 
     Returns a list of (effect_name, trigger, dbconfig, db_name) tuples, or
     (effect_name, trigger, dbconfig, db_name, endpoint_type) when endpoint_types
     is provided.
+
+    Set include_tls=False to drop the TLS and mTLS requirement variants, for suites
+    whose client cannot use a rediss:// endpoint.
     """
     params = []
     try:
@@ -331,6 +372,8 @@ def generate_params(
                     continue
                 trigger_requirements = trigger_info["requirements"]
                 for requirement in trigger_requirements:
+                    if not include_tls and requirement.get("tls"):
+                        continue
                     dbconfig = requirement["dbconfig"]
                     if requirement.get("oss_cluster_api"):
                         ip_type = requirement["oss_cluster_api"]["ip_type"]

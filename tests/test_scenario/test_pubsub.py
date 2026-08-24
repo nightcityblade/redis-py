@@ -1,7 +1,7 @@
 import asyncio
-import copy
 import json
 import logging
+import random
 import threading
 import time
 from collections import defaultdict
@@ -21,13 +21,14 @@ from tests.test_scenario.fault_injector_client import (
     ActionRequest,
     ActionType,
     FaultInjectorClient,
-    NodeInfo,
     ProxyServerFaultInjector,
+    SlotMigrateEffects,
 )
-from tests.test_scenario.common_scenario_helpers import (
+from tests.test_scenario.conftest import _FAULT_INJECTOR_CLIENT_OSS_API
+from tests.test_scenario.maint_notifications_helpers import (
     ClusterOperations,
     KeyGenerationHelpers,
-    delete_database_if_exists,
+    generate_params,
 )
 
 
@@ -42,7 +43,13 @@ INFRASTRUCTURE_RECOVERY_TEST_TIMEOUT = 600
 PUBLISH_INTERVAL = 0.02
 PUBSUB_PROGRESS_LOG_MESSAGE_INTERVAL = 300
 PUBSUB_TEST_SHARDS_COUNT = 3
+PUBSUB_DB_PORT_BASE = 14000
+SHARD_KEY_REGEX = [{"regex": ".*\\{(?<tag>.*)\\}.*"}, {"regex": "(?<tag>.*)"}]
 PUBSUB_CLIENT_TIMEOUT = 5
+# The fault injector blocks on a reshard for up to 600s (ASM scale), so the wait for the
+# effect must outlast it or a slow-but-successful topology change reads as a failure.
+EFFECT_TRIGGER_OP_TIMEOUT = 660
+EFFECT_TRIGGER_TEST_TIMEOUT = 900
 
 
 FAILURE_SCENARIOS = [
@@ -88,6 +95,10 @@ FAILURE_SCENARIOS = [
             parameters={
                 "bdb_id": endpoint_config["bdb_id"],
                 "cluster_index": 0,
+                # The fault injector kills the master shard and then waits for the
+                # database to serve again, so the test does not poll cluster state.
+                "wait_for_active": True,
+                "active_timeout": SHARD_FAILURE_RECOVERY_TIMEOUT,
             },
         ),
         id="shard-failure",
@@ -107,162 +118,97 @@ def action_timeout_for_failure(failure_name):
     return INFRASTRUCTURE_ACTION_TIMEOUT
 
 
-def execute_rladmin_command_action(
-    fault_injector_client: FaultInjectorClient,
-    command,
-    bdb_id,
-    timeout=RECOVERY_TIMEOUT,
-):
-    parameters = {
-        "bdb_id": bdb_id,
-        "rladmin_command": command,
-    }
-    logging.debug("Executing rladmin_command with parameter: %s", parameters)
-    result = fault_injector_client.trigger_action(
-        ActionRequest(
-            action_type=ActionType.EXECUTE_RLADMIN_COMMAND,
-            parameters=parameters,
-        )
-    )
-    action_id = result.get("action_id")
-    if not action_id:
-        pytest.fail(f"Failed to trigger rladmin command action: {result}")
-    return fault_injector_client.get_operation_result(action_id, timeout=timeout)
-
-
-def get_master_shard_on_rladmin_action_node(
-    fault_injector_client: FaultInjectorClient,
-    bdb_id,
-):
-    status_result = execute_rladmin_command_action(
-        fault_injector_client,
-        command="status",
-        bdb_id=bdb_id,
-    )
-    status_output = status_result.get("output", {}).get("output", "")
-    if not status_output:
-        pytest.fail(f"rladmin status did not return output: {status_result}")
-    action_node_id = str(status_result.get("output", {}).get("node_id"))
-
-    shards_section_started = False
-    for line in status_output.splitlines():
-        line = line.strip()
-        if line.startswith("SHARDS:"):
-            shards_section_started = True
-            continue
-        if not shards_section_started or not line or line.startswith("DB:ID"):
-            continue
-
-        parts = line.split()
-        if (
-            len(parts) >= 8
-            and parts[0] == f"db:{bdb_id}"
-            and parts[3] == f"node:{action_node_id}"
-            and parts[4] == "master"
-        ):
-            return parts[2].replace("redis:", "")
-
-    pytest.fail(f"No master shard found for db:{bdb_id} on node:{action_node_id}")
-
-
-def database_and_shards_are_active(status_output, bdb_id):
-    database_active = False
-    shard_count = 0
-    shards_ok = True
-    section = None
-
-    for line in status_output.splitlines():
-        line = line.strip()
-        if line.startswith("DATABASES:"):
-            section = "databases"
-            continue
-        if line.startswith("ENDPOINTS:"):
-            section = "endpoints"
-            continue
-        if line.startswith("SHARDS:"):
-            section = "shards"
-            continue
-
-        if not line or line.startswith("DB:ID"):
-            continue
-
-        parts = line.split()
-        if section == "databases" and len(parts) >= 5 and parts[0] == f"db:{bdb_id}":
-            database_active = parts[4] == "active"
-        elif section == "shards" and len(parts) >= 8 and parts[0] == f"db:{bdb_id}":
-            shard_count += 1
-            shards_ok = shards_ok and parts[-1] == "OK"
-
-    return database_active and shard_count > 0 and shards_ok
-
-
-def wait_for_database_active_after_shard_failure(
-    fault_injector_client: FaultInjectorClient,
-    bdb_id,
-    timeout=RECOVERY_TIMEOUT,
-):
-    deadline = time.time() + timeout
-    last_status_output = ""
-
-    while time.time() < deadline:
-        status_result = execute_rladmin_command_action(
-            fault_injector_client,
-            command="status",
-            bdb_id=bdb_id,
-        )
-        last_status_output = status_result.get("output", {}).get("output", "")
-        if database_and_shards_are_active(last_status_output, bdb_id):
-            return
-        time.sleep(3)
-
-    pytest.fail(
-        f"Timed out waiting for db:{bdb_id} to become active after shard failure. "
-        f"Last rladmin status output: {last_status_output}"
-    )
-
-
 def execute_failure_scenario(
     fault_injector_client: FaultInjectorClient,
     failure_name,
     create_action,
     cluster_endpoint_config,
 ):
-    if failure_name == "shard_failure":
-        bdb_id = cluster_endpoint_config["bdb_id"]
-        shard_id = get_master_shard_on_rladmin_action_node(
-            fault_injector_client, bdb_id
-        )
-        # The deployed shard_failure action fails before shard.kill() because
-        # rlauto cannot resolve the shard's node. Execute the same shard process
-        # kill through the generic command action until that action is fixed.
-        command = (
-            "status >/dev/null; "
-            f"sudo -in kill -9 $(sudo -in cat /var/run/redis/redis-{shard_id}.pid)"
-        )
-        execute_rladmin_command_action(
-            fault_injector_client,
-            command=command,
-            bdb_id=bdb_id,
-            timeout=action_timeout_for_failure(failure_name),
-        )
-        wait_for_database_active_after_shard_failure(
-            fault_injector_client,
-            bdb_id,
-            timeout=action_timeout_for_failure(failure_name),
-        )
-        return
-
-    result = fault_injector_client.trigger_action(create_action(cluster_endpoint_config))
+    result = fault_injector_client.trigger_action(
+        create_action(cluster_endpoint_config)
+    )
     fault_injector_client.get_operation_result(
         result["action_id"],
         timeout=action_timeout_for_failure(failure_name),
     )
 
 
-def make_pubsub_db_config(base_config, test_name):
-    db_config = copy.deepcopy(base_config)
-    db_config["shards_count"] = PUBSUB_TEST_SHARDS_COUNT
-    return db_config
+def execute_migration(
+    fault_injector_client: FaultInjectorClient,
+    cluster_endpoint_config,
+):
+    """Move all master shards of the test database to another node.
+
+    The fault injector picks the target node itself - one holding neither a master
+    nor a replica of this database - so the test never inspects cluster topology.
+    """
+    action_id = ClusterOperations.migrate(
+        fault_injector_client, cluster_endpoint_config
+    )
+    fault_injector_client.get_operation_result(action_id, timeout=RECOVERY_TIMEOUT)
+
+
+def execute_effect_trigger(
+    fault_injector_client: FaultInjectorClient,
+    cluster_endpoint_config,
+    effect_name,
+    trigger,
+    timeout=EFFECT_TRIGGER_OP_TIMEOUT,
+):
+    """Run the fault injector effect/trigger that moves slots between nodes.
+
+    The effect says what changes and the trigger says how it is caused; the fault
+    injector picks the nodes involved, so the test never inspects cluster topology.
+    """
+    action_id = ClusterOperations.trigger_effect(
+        fault_injector=fault_injector_client,
+        endpoint_config=cluster_endpoint_config,
+        effect_name=effect_name,
+        trigger_name=trigger,
+    )
+    fault_injector_client.get_operation_result(action_id, timeout=timeout)
+
+
+def delete_database_if_exists(
+    fault_injector_client: FaultInjectorClient, database_name: str
+):
+    try:
+        bdb_id = ClusterOperations.find_database_id_by_name(
+            fault_injector_client, database_name
+        )
+    except Exception as exc:
+        logging.info("Database %s not found during cleanup: %s", database_name, exc)
+        return
+
+    if bdb_id:
+        fault_injector_client.delete_database(bdb_id)
+
+
+def make_pubsub_db_config():
+    """Build the database config the Pub/Sub scenarios need.
+
+    Defined here rather than read from a bdb config file so the suite carries its own
+    requirements: sharded, OSS-cluster API across every master shard, and a hashtag
+    shard_key_regex so channels can be pinned to a slot. Name and port carry a random
+    suffix, mirroring how the fault injector generates its own configs, so concurrent
+    runs cannot collide with each other or with a fault-injector database.
+    """
+    suffix = random.randint(0, 999)
+    return {
+        "name": f"pubsub-oss-api-{suffix}",
+        "port": PUBSUB_DB_PORT_BASE + suffix,
+        "memory_size": 1273741824,
+        "eviction_policy": "noeviction",
+        "sharding": True,
+        "shards_count": PUBSUB_TEST_SHARDS_COUNT,
+        "shards_placement": "sparse",
+        "replication": True,
+        "oss_cluster": True,
+        "oss_cluster_api_preferred_ip_type": "external",
+        "oss_cluster_api_preferred_endpoint_type": "ip",
+        "proxy_policy": "all-master-shards",
+        "shard_key_regex": SHARD_KEY_REGEX,
+    }
 
 
 def get_cluster_client(
@@ -298,14 +244,13 @@ def get_cluster_client(
 
 @pytest.fixture()
 def cluster_endpoint_config(
-    request,
     fault_injector_client_oss_api: FaultInjectorClient,
-    pubsub_cluster_bdb_config,
 ):
+    """Create a Pub/Sub database for one test and delete it afterwards."""
     if isinstance(fault_injector_client_oss_api, ProxyServerFaultInjector):
         pytest.skip("mock proxy does not currently support Pub/Sub flows")
 
-    db_config = make_pubsub_db_config(pubsub_cluster_bdb_config, request.node.name)
+    db_config = make_pubsub_db_config()
 
     delete_database_if_exists(fault_injector_client_oss_api, db_config["name"])
     try:
@@ -687,7 +632,9 @@ async def async_run_sharded_pubsub_recovery_scenario(
             raise AssertionError(f"{error}; {progress_message()}") from error
         logging.info("Async Pub/Sub baseline reached: %s", progress_message())
 
-        logging.info("Async Pub/Sub cluster action started: %s", cluster_op_action.__name__)
+        logging.info(
+            "Async Pub/Sub cluster action started: %s", cluster_op_action.__name__
+        )
         await asyncio.to_thread(cluster_op_action)
         logging.info("Async Pub/Sub cluster action completed: %s", progress_message())
 
@@ -756,30 +703,7 @@ async def async_run_sharded_pubsub_recovery_scenario(
         logging.info("Async Pub/Sub scenario stopped: %s", progress_message())
 
 
-class TestPubSubBase:
-    @pytest.fixture(autouse=True)
-    def setup(
-        self,
-        fault_injector_client_oss_api: FaultInjectorClient,
-        cluster_endpoint_config,
-    ):
-        try:
-            target_node, empty_node = ClusterOperations.find_target_node_and_empty_node(
-                fault_injector_client_oss_api, cluster_endpoint_config
-            )
-            logging.info(f"Using target_node: {target_node}, empty_node: {empty_node}")
-        except Exception as e:
-            pytest.fail(f"Failed to find target and empty nodes: {e}")
-
-        # Ensure setup completed successfully
-        if not target_node or not empty_node:
-            pytest.fail("Setup failed: target_node or empty_node not available")
-
-        self.target_node: NodeInfo = target_node
-        self.empty_node: NodeInfo = empty_node
-
-
-class TestShardedPubSubMigrationScenario(TestPubSubBase):
+class TestShardedPubSubMigrationScenario:
     @pytest.mark.timeout(300)
     def test_sharded_pubsub_delivery_after_shard_migration(
         self,
@@ -788,13 +712,7 @@ class TestShardedPubSubMigrationScenario(TestPubSubBase):
         cluster_client,
     ):
         def migrate():
-            ClusterOperations.execute_migrate(
-                fault_injector=fault_injector_client_oss_api,
-                endpoint_config=cluster_endpoint_config,
-                target_node=self.target_node.node_id,
-                empty_node=self.empty_node.node_id,
-                timeout=RECOVERY_TIMEOUT,
-            )
+            execute_migration(fault_injector_client_oss_api, cluster_endpoint_config)
 
         run_sharded_pubsub_scenario(
             cluster_client,
@@ -805,7 +723,7 @@ class TestShardedPubSubMigrationScenario(TestPubSubBase):
         )
 
 
-class TestShardedPubSubInfrastructureRecovery(TestPubSubBase):
+class TestShardedPubSubInfrastructureRecovery:
     @pytest.mark.timeout(INFRASTRUCTURE_RECOVERY_TEST_TIMEOUT)
     @pytest.mark.parametrize("subscriber_count", [1, 2])
     @pytest.mark.parametrize("failure_name, create_action", FAILURE_SCENARIOS)
@@ -836,7 +754,7 @@ class TestShardedPubSubInfrastructureRecovery(TestPubSubBase):
         )
 
 
-class TestAsyncShardedPubSubFaultInjectorMigrationScenario(TestPubSubBase):
+class TestAsyncShardedPubSubFaultInjectorMigrationScenario:
     @pytest.mark.asyncio
     @pytest.mark.timeout(300)
     async def test_sharded_pubsub_delivery_after_migration(
@@ -846,17 +764,7 @@ class TestAsyncShardedPubSubFaultInjectorMigrationScenario(TestPubSubBase):
         async_cluster_client,
     ):
         def migrate():
-            target_node, empty_node = ClusterOperations.find_target_node_and_empty_node(
-                fault_injector_client_oss_api,
-                cluster_endpoint_config,
-            )
-            ClusterOperations.execute_migrate(
-                fault_injector=fault_injector_client_oss_api,
-                endpoint_config=cluster_endpoint_config,
-                target_node=target_node.node_id,
-                empty_node=empty_node.node_id,
-                timeout=RECOVERY_TIMEOUT,
-            )
+            execute_migration(fault_injector_client_oss_api, cluster_endpoint_config)
 
         await async_run_sharded_pubsub_recovery_scenario(
             async_cluster_client,
@@ -867,7 +775,7 @@ class TestAsyncShardedPubSubFaultInjectorMigrationScenario(TestPubSubBase):
         )
 
 
-class TestAsyncShardedPubSubInfrastructureRecovery(TestPubSubBase):
+class TestAsyncShardedPubSubInfrastructureRecovery:
     @pytest.mark.asyncio
     @pytest.mark.timeout(INFRASTRUCTURE_RECOVERY_TEST_TIMEOUT)
     @pytest.mark.parametrize("subscriber_count", [1, 2])
@@ -896,4 +804,106 @@ class TestAsyncShardedPubSubInfrastructureRecovery(TestPubSubBase):
             subscriber_count=subscriber_count,
             cluster_op_action=inject_failure,
             recovery_timeout=recovery_timeout_for_failure(failure_name),
+        )
+
+
+# Collected from the live fault injector at import time. TLS variants are dropped because
+# the Pub/Sub client rejects rediss:// endpoints. When the deployment offers nothing usable
+# (fault injector unreachable, or only the ASM `reshard` trigger on a cluster whose server
+# cannot emit ASM notifications) the suite reports a skip rather than silently collecting
+# zero tests.
+SLOT_SHUFFLE_EFFECT_PARAMS = generate_params(
+    _FAULT_INJECTOR_CLIENT_OSS_API,
+    [SlotMigrateEffects.SLOT_SHUFFLE],
+    include_tls=False,
+) or [
+    pytest.param(
+        None,
+        None,
+        None,
+        None,
+        marks=pytest.mark.skip(
+            reason="fault injector returned no usable slot-shuffle effect/trigger params"
+        ),
+    )
+]
+
+
+class TestShardedPubSubTopologyChangeWithEffectTrigger:
+    """Sharded Pub/Sub delivery across fault-injector effects and triggers.
+
+    The infrastructure-recovery class above drives unplanned faults as plain actions.
+    These cases are the opposite kind of event: planned topology changes, which the
+    fault injector models as an effect (what changes) plus a trigger (how it is
+    caused), and for which it supplies the database config each combination needs.
+    Parameters therefore come from the fault injector rather than from a local bdb
+    config, and a combination the deployment does not support never appears.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_and_cleanup(self):
+        self._bdb_name = None
+        self._client = None
+
+        yield
+
+        if self._client is not None:
+            self._client.close()
+        if self._bdb_name:
+            delete_database_if_exists(_FAULT_INJECTOR_CLIENT_OSS_API, self._bdb_name)
+
+    def setup_env(
+        self,
+        fault_injector_client: FaultInjectorClient,
+        db_config: dict[str, Any],
+    ):
+        """Create the database the effect/trigger requires and a client for it."""
+        delete_database_if_exists(fault_injector_client, db_config["name"])
+        self._bdb_name = db_config["name"]
+
+        endpoint_config = fault_injector_client.create_database(db_config)
+        endpoint_config["shards_count"] = db_config["shards_count"]
+
+        self._client = get_cluster_client(endpoints_config=endpoint_config)
+        return self._client, endpoint_config
+
+    @pytest.mark.timeout(EFFECT_TRIGGER_TEST_TIMEOUT)
+    @pytest.mark.parametrize("subscriber_count", [1, 2])
+    @pytest.mark.parametrize(
+        "effect_name, trigger, db_config, db_name", SLOT_SHUFFLE_EFFECT_PARAMS
+    )
+    def test_sharded_pubsub_delivery_during_slot_shuffle(
+        self,
+        fault_injector_client_oss_api: FaultInjectorClient,
+        effect_name,
+        trigger,
+        db_config,
+        db_name,
+        subscriber_count,
+    ):
+        """Slots move between existing nodes; no node is added or removed.
+
+        Sharded Pub/Sub must keep delivering: the client has to notice the slot map
+        change and re-subscribe the affected channels on their new owner.
+        """
+        logging.info(
+            "DB name: %s | effect=%s trigger=%s", db_name, effect_name, trigger
+        )
+
+        client, endpoint_config = self.setup_env(
+            fault_injector_client_oss_api, db_config
+        )
+
+        def shuffle_slots():
+            execute_effect_trigger(
+                fault_injector_client_oss_api, endpoint_config, effect_name, trigger
+            )
+
+        run_sharded_pubsub_scenario(
+            client,
+            endpoint_config,
+            channel_prefix=f"pubsub-{effect_name}-{trigger}",
+            subscriber_count=subscriber_count,
+            cluster_op_action=shuffle_slots,
+            recovery_timeout=RECOVERY_TIMEOUT,
         )
