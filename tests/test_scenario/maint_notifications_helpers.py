@@ -284,9 +284,14 @@ class KeyGenerationHelpers:
                 end_slot = start_slot + slots_per_shard - 1
 
             # Generate keys for this shard's slot range
+            span = end_slot - start_slot + 1
             for i in range(keys_per_shard):
-                # Pick a slot within this shard's range
-                slot_number = start_slot + (i % (end_slot - start_slot + 1))
+                # Spread the keys across the shard's slot range instead of clustering
+                # them at its start. Slots one apart almost always migrate together, so
+                # adjacent keys never produce the partial move that leaves a per-node
+                # PubSub holding some but not all of its channels. Identical to the
+                # previous formula at keys_per_shard=1, which every other caller uses.
+                slot_number = start_slot + (i * span) // keys_per_shard
                 keys.append(KeyGenerationHelpers.generate_key(slot_number, prefix))
 
         return keys

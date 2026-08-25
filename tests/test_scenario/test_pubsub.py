@@ -43,13 +43,33 @@ INFRASTRUCTURE_RECOVERY_TEST_TIMEOUT = 600
 PUBLISH_INTERVAL = 0.02
 PUBSUB_PROGRESS_LOG_MESSAGE_INTERVAL = 300
 PUBSUB_TEST_SHARDS_COUNT = 3
+# More than one channel per shard so a per-node PubSub holds several shard channels on
+# several slots. That reaches two branches no live test reaches at one channel per
+# shard: the slot-grouped SSUBSCRIBE replay on reconnect
+# (ClusterPubSub._resubscribe_shard_channels, which exists to avoid CROSSSLOT) and
+# "keep the per-node pubsub while it still has channels, drop it only once empty".
+# Two is the minimum that reaches both;
+DEFAULT_CHANNELS_PER_SHARD = 2
 PUBSUB_DB_PORT_BASE = 14000
 SHARD_KEY_REGEX = [{"regex": ".*\\{(?<tag>.*)\\}.*"}, {"regex": "(?<tag>.*)"}]
 PUBSUB_CLIENT_TIMEOUT = 5
 # The fault injector blocks on a reshard for up to 600s (ASM scale), so the wait for the
 # effect must outlast it or a slow-but-successful topology change reads as a failure.
 EFFECT_TRIGGER_OP_TIMEOUT = 660
-EFFECT_TRIGGER_TEST_TIMEOUT = 900
+# Node add and remove reconciliation has more to do than a shuffle between existing
+# nodes: a per-node PubSub is created for a node that did not exist at subscribe time
+# and another is torn down, and a channel whose migration is deferred on a transient
+# ConnectionError only retries on the next slots-cache change.
+EFFECT_RECOVERY_TIMEOUT = 240
+# Worst case is the baseline wait, the fault injector's own wait, and the two
+# post-recovery waits run back to back. Derived from the parts rather than set to a
+# round number so the cap cannot silently fall behind them; it only bites on failure.
+EFFECT_TRIGGER_TEST_TIMEOUT = (
+    BASELINE_TIMEOUT + EFFECT_TRIGGER_OP_TIMEOUT + 2 * EFFECT_RECOVERY_TIMEOUT + 180
+)
+# Same shape for the plain-action migration tests: their fault-injector wait is
+# RECOVERY_TIMEOUT rather than the effect budget, so all three waits are equal.
+MIGRATION_TEST_TIMEOUT = BASELINE_TIMEOUT + 3 * RECOVERY_TIMEOUT + 120
 
 
 FAILURE_SCENARIOS = [
@@ -118,6 +138,12 @@ def action_timeout_for_failure(failure_name):
     return INFRASTRUCTURE_ACTION_TIMEOUT
 
 
+def recovery_timeout_for_effect(effect_name):
+    if effect_name == SlotMigrateEffects.SLOT_SHUFFLE:
+        return RECOVERY_TIMEOUT
+    return EFFECT_RECOVERY_TIMEOUT
+
+
 def execute_failure_scenario(
     fault_injector_client: FaultInjectorClient,
     failure_name,
@@ -182,6 +208,48 @@ def delete_database_if_exists(
 
     if bdb_id:
         fault_injector_client.delete_database(bdb_id)
+
+
+def create_effect_database(
+    fault_injector_client: FaultInjectorClient,
+    db_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Create the database a fault-injector effect/trigger requires.
+
+    Returns the endpoint config with the shard count copied across: the injector's
+    create_database output does not carry it, and the drivers need it to place channels
+    on every shard. Unlike make_pubsub_db_config the config is not authored here, so it
+    is used as the injector supplies it - every slot-migrate dbconfig it serves is
+    sharded, oss_cluster, and carries the standard hashtag shard_key_regex, which is
+    what the channel-to-slot mapping in KeyGenerationHelpers.redis_slot relies on.
+    """
+    delete_database_if_exists(fault_injector_client, db_config["name"])
+    endpoint_config = fault_injector_client.create_database(db_config)
+    endpoint_config["shards_count"] = db_config["shards_count"]
+    return endpoint_config
+
+
+def dedupe_effect_params(
+    params: list[tuple[Any, ...]],
+) -> list[tuple[Any, ...]]:
+    """Keep one parameter set per effect and trigger.
+
+    The injector offers every effect/trigger pair twice, once per
+    oss_cluster_api_preferred_endpoint_type (ip and hostname). get_cluster_client
+    resolves endpoints[0] the same way for both, so the pair is a near-duplicate for
+    Pub/Sub, and generate_params already strips the random name suffix that told them
+    apart - both arrive carrying the same database name. Keeping one halves an
+    already slow matrix without dropping a distinct topology.
+    """
+    seen = set()
+    deduped = []
+    for param in params:
+        effect_and_trigger = (param[0], param[1])
+        if effect_and_trigger in seen:
+            continue
+        seen.add(effect_and_trigger)
+        deduped.append(param)
+    return deduped
 
 
 def make_pubsub_db_config():
@@ -296,11 +364,12 @@ def run_sharded_pubsub_scenario(
     subscriber_count,
     cluster_op_action,
     recovery_timeout=RECOVERY_TIMEOUT,
+    channels_per_shard=DEFAULT_CHANNELS_PER_SHARD,
 ):
     channels = KeyGenerationHelpers.generate_keys_for_all_shards(
         shards_count=endpoint_config["shards_count"],
         prefix=channel_prefix,
-        keys_per_shard=1,
+        keys_per_shard=channels_per_shard,
     )
     state_lock = threading.Lock()
     subscribers = []
@@ -314,8 +383,9 @@ def run_sharded_pubsub_scenario(
     subscriber_errors = 0
 
     logging.info(
-        "Pub/Sub scenario started: channels=%s subscribers=%s",
+        "Pub/Sub scenario started: channels=%s channels_per_shard=%s subscribers=%s",
         len(channels),
+        channels_per_shard,
         subscriber_count,
     )
 
@@ -521,11 +591,12 @@ async def async_run_sharded_pubsub_recovery_scenario(
     subscriber_count,
     cluster_op_action,
     recovery_timeout=RECOVERY_TIMEOUT,
+    channels_per_shard=DEFAULT_CHANNELS_PER_SHARD,
 ):
     channels = KeyGenerationHelpers.generate_keys_for_all_shards(
         shards_count=endpoint_config["shards_count"],
         prefix=channel_prefix,
-        keys_per_shard=1,
+        keys_per_shard=channels_per_shard,
     )
     subscribers = []
     reader_tasks = []
@@ -536,18 +607,36 @@ async def async_run_sharded_pubsub_recovery_scenario(
     sent_messages = 0
     received_messages = 0
     publish_errors = 0
+    subscriber_errors = 0
 
     logging.info(
-        "Async Pub/Sub scenario started: channels=%s subscribers=%s",
+        "Async Pub/Sub scenario started: channels=%s channels_per_shard=%s "
+        "subscribers=%s",
         len(channels),
+        channels_per_shard,
         subscriber_count,
     )
 
     def progress_message():
+        subscriber_tasks_alive = sum(not task.done() for task in reader_tasks)
         return (
             f"sent={sent_messages}, received={received_messages}, "
-            f"publish_errors={publish_errors}"
+            f"publish_errors={publish_errors}, "
+            f"subscriber_errors={subscriber_errors}, "
+            f"subscriber_tasks_alive={subscriber_tasks_alive}/{len(reader_tasks)}"
         )
+
+    def handle_subscriber_error(error):
+        # No lock, unlike the sync twin: every reader runs on the one event loop, so
+        # the increment cannot interleave with another reader's.
+        nonlocal subscriber_errors
+        subscriber_errors += 1
+        if subscriber_errors == 1 or subscriber_errors % 10 == 0:
+            logging.info(
+                "Async Pub/Sub subscriber read error: errors=%s error=%r",
+                subscriber_errors,
+                error,
+            )
 
     async def publish_messages():
         nonlocal publish_errors, sent_messages
@@ -570,10 +659,14 @@ async def async_run_sharded_pubsub_recovery_scenario(
                     if sent_messages % PUBSUB_PROGRESS_LOG_MESSAGE_INTERVAL == 0:
                         logging.info(
                             "Async Pub/Sub progress: sent=%s received=%s "
-                            "publish_errors=%s",
+                            "publish_errors=%s subscriber_errors=%s "
+                            "subscriber_tasks_alive=%s/%s",
                             sent_messages,
                             received_messages,
                             publish_errors,
+                            subscriber_errors,
+                            sum(not task.done() for task in reader_tasks),
+                            len(reader_tasks),
                         )
             await asyncio.sleep(PUBLISH_INTERVAL)
 
@@ -584,9 +677,10 @@ async def async_run_sharded_pubsub_recovery_scenario(
                     ignore_subscribe_messages=True,
                     timeout=0.01,
                 )
-            except Exception:
+            except Exception as error:
                 if stop_event.is_set():
                     return
+                handle_subscriber_error(error)
                 await asyncio.sleep(0.05)
 
     try:
@@ -704,10 +798,12 @@ async def async_run_sharded_pubsub_recovery_scenario(
 
 
 class TestShardedPubSubMigrationScenario:
-    @pytest.mark.timeout(300)
+    @pytest.mark.timeout(MIGRATION_TEST_TIMEOUT)
+    @pytest.mark.parametrize("subscriber_count", [1, 2])
     def test_sharded_pubsub_delivery_after_shard_migration(
         self,
         fault_injector_client_oss_api: FaultInjectorClient,
+        subscriber_count,
         cluster_endpoint_config,
         cluster_client,
     ):
@@ -718,7 +814,7 @@ class TestShardedPubSubMigrationScenario:
             cluster_client,
             cluster_endpoint_config,
             channel_prefix="pubsub-migration",
-            subscriber_count=1,
+            subscriber_count=subscriber_count,
             cluster_op_action=migrate,
         )
 
@@ -756,10 +852,12 @@ class TestShardedPubSubInfrastructureRecovery:
 
 class TestAsyncShardedPubSubFaultInjectorMigrationScenario:
     @pytest.mark.asyncio
-    @pytest.mark.timeout(300)
+    @pytest.mark.timeout(MIGRATION_TEST_TIMEOUT)
+    @pytest.mark.parametrize("subscriber_count", [1, 2])
     async def test_sharded_pubsub_delivery_after_migration(
         self,
         fault_injector_client_oss_api: FaultInjectorClient,
+        subscriber_count,
         cluster_endpoint_config,
         async_cluster_client,
     ):
@@ -770,7 +868,7 @@ class TestAsyncShardedPubSubFaultInjectorMigrationScenario:
             async_cluster_client,
             cluster_endpoint_config,
             channel_prefix="async-pubsub-migration",
-            subscriber_count=1,
+            subscriber_count=subscriber_count,
             cluster_op_action=migrate,
         )
 
@@ -807,15 +905,29 @@ class TestAsyncShardedPubSubInfrastructureRecovery:
         )
 
 
-# Collected from the live fault injector at import time. TLS variants are dropped because
-# the Pub/Sub client rejects rediss:// endpoints. When the deployment offers nothing usable
-# (fault injector unreachable, or only the ASM `reshard` trigger on a cluster whose server
-# cannot emit ASM notifications) the suite reports a skip rather than silently collecting
+# Collected from the live fault injector at import time. TLS variants are dropped
+# because the Pub/Sub client rejects rediss:// endpoints, and the injector's two
+# endpoint-type variants of each pair are collapsed to one. All four slot-migrate
+# effects are covered: slot-shuffle moves slots between existing nodes, add brings in a
+# node that did not exist when the channels were subscribed, remove takes the owning
+# node out of the topology, and remove-add does both. No skip_combinations are passed:
+# the maint-notification suite skips pairs whose maintenance window closes too fast to
+# observe a notification on a freshly opened connection, but these tests measure
+# end-to-end delivery after the operation completes, so a short window is still a valid
+# case. When the deployment offers nothing usable (fault injector unreachable, or every
+# combination filtered out) the suite reports a skip rather than silently collecting
 # zero tests.
-SLOT_SHUFFLE_EFFECT_PARAMS = generate_params(
-    _FAULT_INJECTOR_CLIENT_OSS_API,
-    [SlotMigrateEffects.SLOT_SHUFFLE],
-    include_tls=False,
+SLOT_MIGRATE_EFFECT_PARAMS = dedupe_effect_params(
+    generate_params(
+        _FAULT_INJECTOR_CLIENT_OSS_API,
+        [
+            SlotMigrateEffects.SLOT_SHUFFLE,
+            SlotMigrateEffects.ADD,
+            SlotMigrateEffects.REMOVE,
+            SlotMigrateEffects.REMOVE_ADD,
+        ],
+        include_tls=False,
+    )
 ) or [
     pytest.param(
         None,
@@ -823,10 +935,15 @@ SLOT_SHUFFLE_EFFECT_PARAMS = generate_params(
         None,
         None,
         marks=pytest.mark.skip(
-            reason="fault injector returned no usable slot-shuffle effect/trigger params"
+            reason="fault injector returned no usable slot-migrate effect/trigger params"
         ),
     )
 ]
+# The effect matrix already varies shards_count from 1 to 10, which exercises the
+# reconciler harder than a second subscriber does, and the infrastructure-recovery
+# classes above already cover subscriber_count 2 on both stacks. One subscriber here
+# keeps a matrix that creates and deletes a database per case affordable.
+EFFECT_TRIGGER_SUBSCRIBER_COUNT = 1
 
 
 class TestShardedPubSubTopologyChangeWithEffectTrigger:
@@ -858,33 +975,29 @@ class TestShardedPubSubTopologyChangeWithEffectTrigger:
         db_config: dict[str, Any],
     ):
         """Create the database the effect/trigger requires and a client for it."""
-        delete_database_if_exists(fault_injector_client, db_config["name"])
         self._bdb_name = db_config["name"]
-
-        endpoint_config = fault_injector_client.create_database(db_config)
-        endpoint_config["shards_count"] = db_config["shards_count"]
-
+        endpoint_config = create_effect_database(fault_injector_client, db_config)
         self._client = get_cluster_client(endpoints_config=endpoint_config)
         return self._client, endpoint_config
 
     @pytest.mark.timeout(EFFECT_TRIGGER_TEST_TIMEOUT)
-    @pytest.mark.parametrize("subscriber_count", [1, 2])
     @pytest.mark.parametrize(
-        "effect_name, trigger, db_config, db_name", SLOT_SHUFFLE_EFFECT_PARAMS
+        "effect_name, trigger, db_config, db_name", SLOT_MIGRATE_EFFECT_PARAMS
     )
-    def test_sharded_pubsub_delivery_during_slot_shuffle(
+    def test_sharded_pubsub_delivery_during_slot_migration(
         self,
         fault_injector_client_oss_api: FaultInjectorClient,
         effect_name,
         trigger,
         db_config,
         db_name,
-        subscriber_count,
     ):
-        """Slots move between existing nodes; no node is added or removed.
+        """Slots move between nodes; nodes may also be added or removed.
 
         Sharded Pub/Sub must keep delivering: the client has to notice the slot map
-        change and re-subscribe the affected channels on their new owner.
+        change and re-subscribe the affected channels on their new owner, creating a
+        per-node PubSub for a node that did not exist at subscribe time (add) and
+        dropping one whose node left the topology (remove).
         """
         logging.info(
             "DB name: %s | effect=%s trigger=%s", db_name, effect_name, trigger
@@ -894,7 +1007,7 @@ class TestShardedPubSubTopologyChangeWithEffectTrigger:
             fault_injector_client_oss_api, db_config
         )
 
-        def shuffle_slots():
+        def migrate_slots():
             execute_effect_trigger(
                 fault_injector_client_oss_api, endpoint_config, effect_name, trigger
             )
@@ -902,8 +1015,95 @@ class TestShardedPubSubTopologyChangeWithEffectTrigger:
         run_sharded_pubsub_scenario(
             client,
             endpoint_config,
-            channel_prefix=f"pubsub-{effect_name}-{trigger}",
-            subscriber_count=subscriber_count,
-            cluster_op_action=shuffle_slots,
-            recovery_timeout=RECOVERY_TIMEOUT,
+            channel_prefix=f"pubsub-{effect_name.value}-{trigger}",
+            subscriber_count=EFFECT_TRIGGER_SUBSCRIBER_COUNT,
+            cluster_op_action=migrate_slots,
+            recovery_timeout=recovery_timeout_for_effect(effect_name),
+        )
+
+
+class TestAsyncShardedPubSubTopologyChangeWithEffectTrigger:
+    """Async mirror of TestShardedPubSubTopologyChangeWithEffectTrigger.
+
+    Same fault-injector effects and triggers, driven through the async cluster client,
+    so the async reconciliation path is exercised by a planned topology change and not
+    only by the unplanned faults above. The fault injector client is the sync one:
+    AsyncFaultInjectorClient has no migrate, generate_params is synchronous and runs at
+    collection time, and the driver already pushes the blocking cluster action onto a
+    worker thread, so an async fault-injector surface would buy nothing here.
+    """
+
+    @pytest_asyncio.fixture(autouse=True)
+    async def setup_and_cleanup(self):
+        self._bdb_name = None
+        self._client = None
+
+        yield
+
+        if self._client is not None:
+            await self._client.aclose()
+        if self._bdb_name:
+            delete_database_if_exists(_FAULT_INJECTOR_CLIENT_OSS_API, self._bdb_name)
+
+    def setup_env(
+        self,
+        fault_injector_client: FaultInjectorClient,
+        db_config: dict[str, Any],
+    ):
+        """Create the database the effect/trigger requires and a client for it.
+
+        Stays synchronous even though it builds an async client: the fault-injector
+        calls block, but they run before any publisher or reader task exists, so there
+        is no event loop to starve. ClusterPubSub.ssubscribe awaits its own
+        _ensure_cluster_initialized, so no explicit initialize() is needed either.
+        """
+        self._bdb_name = db_config["name"]
+        endpoint_config = create_effect_database(fault_injector_client, db_config)
+        self._client = get_cluster_client(
+            endpoints_config=endpoint_config,
+            client_class=AsyncRedisCluster,
+            retry_class=AsyncRetry,
+        )
+        return self._client, endpoint_config
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(EFFECT_TRIGGER_TEST_TIMEOUT)
+    @pytest.mark.parametrize(
+        "effect_name, trigger, db_config, db_name", SLOT_MIGRATE_EFFECT_PARAMS
+    )
+    async def test_sharded_pubsub_delivery_during_slot_migration(
+        self,
+        fault_injector_client_oss_api: FaultInjectorClient,
+        effect_name,
+        trigger,
+        db_config,
+        db_name,
+    ):
+        """Slots move between nodes; nodes may also be added or removed.
+
+        Sharded Pub/Sub must keep delivering: the client has to notice the slot map
+        change and re-subscribe the affected channels on their new owner, creating a
+        per-node PubSub for a node that did not exist at subscribe time (add) and
+        dropping one whose node left the topology (remove).
+        """
+        logging.info(
+            "DB name: %s | effect=%s trigger=%s", db_name, effect_name, trigger
+        )
+
+        client, endpoint_config = self.setup_env(
+            fault_injector_client_oss_api, db_config
+        )
+
+        def migrate_slots():
+            execute_effect_trigger(
+                fault_injector_client_oss_api, endpoint_config, effect_name, trigger
+            )
+
+        await async_run_sharded_pubsub_recovery_scenario(
+            client,
+            endpoint_config,
+            channel_prefix=f"async-pubsub-{effect_name.value}-{trigger}",
+            subscriber_count=EFFECT_TRIGGER_SUBSCRIBER_COUNT,
+            cluster_op_action=migrate_slots,
+            recovery_timeout=recovery_timeout_for_effect(effect_name),
         )

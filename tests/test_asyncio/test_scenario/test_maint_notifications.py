@@ -5,7 +5,7 @@ import json
 import logging
 import random
 import time
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 import pytest
 import pytest_asyncio
@@ -55,9 +55,13 @@ logging.getLogger("redis.asyncio.maint_notifications").setLevel(logging.DEBUG)
 logging.getLogger("redis.asyncio.cluster").setLevel(logging.DEBUG)
 
 STANDALONE_MAINT_TIMEOUT = 60
-SLOT_SHUFFLE_TIMEOUT = 120
-SMIGRATING_TIMEOUT = 20
-SMIGRATED_TIMEOUT = 40
+
+SMIGRATED_TIMEOUT = 120
+SLOT_SHUFFLE_TIMEOUT = 300
+RESHARD_SMIGRATING_TIMEOUT = int(SLOT_SHUFFLE_TIMEOUT / 2)
+RESHARD_OP_TIMEOUT = 600
+DEFAULT_TRIGGER_OP_TIMEOUT = 180
+RESHARD_TEST_TIMEOUT = RESHARD_OP_TIMEOUT + SMIGRATED_TIMEOUT + 180
 
 DEFAULT_BIND_TTL = 15
 DEFAULT_STANDALONE_CLIENT_SOCKET_TIMEOUT = 1
@@ -248,7 +252,7 @@ class TestAsyncPushNotificationsBase:
         target_node: Optional[str] = None,
         empty_node: Optional[str] = None,
         skip_end_notification: bool = False,
-        timeout: int = SLOT_SHUFFLE_TIMEOUT,
+        timeout: int = DEFAULT_TRIGGER_OP_TIMEOUT,
     ):
         action_id = await fault_injector_client.trigger_effect(
             endpoint_config=endpoints_config,
@@ -1274,6 +1278,57 @@ class TestAsyncClusterClientPushNotificationsWithEffectTriggerBase(
             await asyncio.gather(*tasks, return_exceptions=True)
         await asyncio.sleep(0)
 
+    async def _wait_for_node_cache_reconciliation(
+        self,
+        client: RedisCluster,
+        connections: List,
+        is_reconciled: Callable[[Dict[str, Any]], bool],
+        description: str,
+        timeout: int = SMIGRATED_TIMEOUT,
+    ):
+        """Drain pending notifications until the client node cache reconciles.
+
+        Async counterpart of the sync suite's ``_wait_for_node_cache_delta``,
+        generalized to a predicate over the node cache so it also covers the
+        net-zero node-replace case (one node removed and one added leaves the
+        cache size unchanged).
+
+        A topology change may arrive as several push notifications - in particular an
+        ASM scale add/remove is a cascade of SMIGRATING/SMIGRATED as the decision
+        engine moves slots - so the client reconciles its node cache over multiple
+        notifications after the server-side operation finishes. Reading a single
+        SMIGRATED frame off a single connection is therefore not enough; poll,
+        draining pending pushes on the given connections, until ``is_reconciled``
+        holds. Single-step triggers (migrate/failover) reach the target immediately
+        and return on the first check.
+
+        Draining pushes alone is not sufficient in the async client: SMIGRATED
+        handling is scheduled as a background task instead of completing inline while
+        reading the command response, so every round also drains those tasks.
+        """
+        deadline = time.time() + timeout
+        while True:
+            await self._drain_maint_notification_tasks(client)
+            if is_reconciled(client.nodes_manager.nodes_cache):
+                return
+            if time.time() >= deadline:
+                break
+            for conn in connections:
+                try:
+                    if conn.is_connected and await conn.can_read():
+                        await conn.read_response(push_request=True)
+                except Exception as e:
+                    # A connection to a node being removed may error; that is expected.
+                    logging.debug(f"Ignored error while draining notifications: {e}")
+            await asyncio.sleep(0.5)
+        # Fail explicitly on a drain timeout so it surfaces as a clear "node cache did
+        # not reconcile" error, rather than silently returning and letting the caller's
+        # exact assertion fail later with a misleading node-count message.
+        pytest.fail(
+            f"Node cache did not reconcile ({description}) within {timeout}s; "
+            f"current nodes={sorted(client.nodes_manager.nodes_cache)}"
+        )
+
     @pytest_asyncio.fixture(autouse=True)
     async def setup_and_cleanup(self):
         self.maintenance_ops_tasks = []
@@ -1301,7 +1356,9 @@ class TestAsyncClusterClientPushNotificationsWithEffectTriggerBase(
 class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
     TestAsyncClusterClientPushNotificationsWithEffectTriggerBase
 ):
-    @pytest.mark.timeout(300)
+    @pytest.mark.timeout(
+        RESHARD_TEST_TIMEOUT
+    )  # sized for slow ASM reshard, see RESHARD_OP_TIMEOUT
     @pytest.mark.parametrize(
         "effect_name, trigger, db_config, db_name",
         generate_params(
@@ -1336,6 +1393,7 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
                 cluster_endpoint_config,
                 effect_name,
                 trigger,
+                timeout=RESHARD_OP_TIMEOUT,
             )
         )
         self.maintenance_ops_tasks.append(trigger_task)
@@ -1344,7 +1402,7 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
         for conn in in_use_connections.values():
             await AsyncClientValidations.wait_push_notification(
                 client,
-                timeout=int(SLOT_SHUFFLE_TIMEOUT / 2),
+                timeout=RESHARD_SMIGRATING_TIMEOUT,
                 connection=conn,
             )
 
@@ -1395,7 +1453,9 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
         await trigger_task
         self.maintenance_ops_tasks.remove(trigger_task)
 
-    @pytest.mark.timeout(300)
+    @pytest.mark.timeout(
+        RESHARD_TEST_TIMEOUT
+    )  # sized for slow ASM reshard, see RESHARD_OP_TIMEOUT
     @pytest.mark.parametrize(
         "effect_name, trigger, db_config, db_name",
         generate_params(
@@ -1431,6 +1491,7 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
                 cluster_endpoint_config,
                 effect_name,
                 trigger,
+                timeout=RESHARD_OP_TIMEOUT,
             )
         )
         self.maintenance_ops_tasks.append(trigger_task)
@@ -1439,7 +1500,7 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
         for conn in in_use_connections.values():
             await AsyncClientValidations.wait_push_notification(
                 client,
-                timeout=SMIGRATING_TIMEOUT,
+                timeout=RESHARD_SMIGRATING_TIMEOUT,
                 connection=conn,
             )
 
@@ -1458,7 +1519,19 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
             timeout=SMIGRATED_TIMEOUT,
             connection=con_to_read_smigrated,
         )
-        await self._drain_maint_notification_tasks(client)
+        logging.info("Waiting for the operation to finish server-side...")
+        await trigger_task
+        self.maintenance_ops_tasks.remove(trigger_task)
+
+        logging.info("Draining notifications until one node has been replaced...")
+        initial_nodes = set(initial_cluster_nodes.values())
+        await self._wait_for_node_cache_reconciliation(
+            client,
+            list(in_use_connections.values()),
+            lambda cache: len(initial_nodes - set(cache.values())) == 1
+            and len(set(cache.values()) - initial_nodes) == 1,
+            "expected exactly one node removed and one added",
+        )
 
         logging.info("Validating connection state after SMIGRATED ...")
         updated_cluster_nodes = client.nodes_manager.nodes_cache.copy()
@@ -1485,10 +1558,9 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
         for node, conn in in_use_connections.items():
             node.release(conn)
 
-        await trigger_task
-        self.maintenance_ops_tasks.remove(trigger_task)
-
-    @pytest.mark.timeout(300)
+    @pytest.mark.timeout(
+        RESHARD_TEST_TIMEOUT
+    )  # sized for slow ASM reshard, see RESHARD_OP_TIMEOUT
     @pytest.mark.parametrize(
         "effect_name, trigger, db_config, db_name",
         generate_params(
@@ -1524,6 +1596,7 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
                 cluster_endpoint_config,
                 effect_name,
                 trigger,
+                timeout=RESHARD_OP_TIMEOUT,
             )
         )
         self.maintenance_ops_tasks.append(trigger_task)
@@ -1532,7 +1605,7 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
         for conn in in_use_connections.values():
             await AsyncClientValidations.wait_push_notification(
                 client,
-                timeout=int(SLOT_SHUFFLE_TIMEOUT / 2),
+                timeout=RESHARD_SMIGRATING_TIMEOUT,
                 connection=conn,
             )
 
@@ -1551,7 +1624,18 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
             timeout=SMIGRATED_TIMEOUT,
             connection=con_to_read_smigrated,
         )
-        await self._drain_maint_notification_tasks(client)
+        logging.info("Waiting for the operation to finish server-side...")
+        await trigger_task
+        self.maintenance_ops_tasks.remove(trigger_task)
+
+        logging.info("Draining notifications until the node cache reflects -1 node...")
+        expected_node_count = len(initial_cluster_nodes) - 1
+        await self._wait_for_node_cache_reconciliation(
+            client,
+            list(in_use_connections.values()),
+            lambda cache: len(cache) == expected_node_count,
+            f"expected {expected_node_count} nodes, one fewer than at start",
+        )
 
         logging.info("Validating connection state after SMIGRATED ...")
         updated_cluster_nodes = client.nodes_manager.nodes_cache.copy()
@@ -1583,14 +1667,13 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
         for node, conn in in_use_connections.items():
             node.release(conn)
 
-        await trigger_task
-        self.maintenance_ops_tasks.remove(trigger_task)
-
 
 class TestAsyncClusterClientCommandsExecutionWithPushNotificationsWithEffectTrigger(
     TestAsyncClusterClientPushNotificationsWithEffectTriggerBase
 ):
-    @pytest.mark.timeout(300)
+    @pytest.mark.timeout(
+        RESHARD_TEST_TIMEOUT
+    )  # sized for slow ASM reshard, see RESHARD_OP_TIMEOUT
     @pytest.mark.parametrize(
         "effect_name, trigger, db_config, db_name",
         generate_params(
@@ -1691,6 +1774,7 @@ class TestAsyncClusterClientCommandsExecutionWithPushNotificationsWithEffectTrig
                 cluster_endpoint_config,
                 effect_name,
                 trigger,
+                timeout=RESHARD_OP_TIMEOUT,
             )
         )
         self.maintenance_ops_tasks.append(trigger_task)
