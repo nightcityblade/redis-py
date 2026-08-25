@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import json
 import logging
 import random
@@ -43,6 +44,18 @@ INFRASTRUCTURE_RECOVERY_TEST_TIMEOUT = 600
 PUBLISH_INTERVAL = 0.02
 PUBSUB_PROGRESS_LOG_MESSAGE_INTERVAL = 300
 PUBSUB_TEST_SHARDS_COUNT = 3
+# Redis Enterprise shard placement. Sparse spreads the shards of a database over as
+# many nodes as it can, dense packs them onto as few as it can. Sparse is what the
+# scenarios want by default - a fault injected on any node then lands on this database.
+# The migration scenarios need dense instead: the fault injector's migrate action picks
+# the target itself, a node holding neither a master nor a replica of the database, and
+# on the three-node test cluster sparse placement of three replicated shards leaves no
+# such node, so the action fails before the client is exercised at all. Dense puts the
+# masters on one node and the replicas on another, which frees the third and makes the
+# migration move every master shard onto a node that was not in the slot map when the
+# channels were subscribed.
+SPARSE_SHARDS_PLACEMENT = "sparse"
+DENSE_SHARDS_PLACEMENT = "dense"
 # More than one channel per shard so a per-node PubSub holds several shard channels on
 # several slots. That reaches two branches no live test reaches at one channel per
 # shard: the slot-grouped SSUBSCRIBE replay on reconnect
@@ -51,6 +64,13 @@ PUBSUB_TEST_SHARDS_COUNT = 3
 # Two is the minimum that reaches both;
 DEFAULT_CHANNELS_PER_SHARD = 2
 PUBSUB_DB_PORT_BASE = 14000
+# Every database this suite creates takes its port - and, where the name is ours to
+# choose, its name suffix - from this counter, so no port is used twice in a run.
+# Redis Enterprise releases a deleted database's port asynchronously and rejects a
+# create that lands on one still held, which is what a fixed port per config runs into
+# when one case's database is created seconds after the previous case's was deleted.
+# The base is random so a run cannot collide with a database another run left behind.
+_DB_SUFFIXES = itertools.count(random.randint(0, 500))
 SHARD_KEY_REGEX = [{"regex": ".*\\{(?<tag>.*)\\}.*"}, {"regex": "(?<tag>.*)"}]
 PUBSUB_CLIENT_TIMEOUT = 5
 # The fault injector blocks on a reshard for up to 600s (ASM scale), so the wait for the
@@ -210,6 +230,11 @@ def delete_database_if_exists(
         fault_injector_client.delete_database(bdb_id)
 
 
+def next_db_suffix() -> int:
+    """Return the next name and port suffix for a database this suite creates."""
+    return next(_DB_SUFFIXES)
+
+
 def create_effect_database(
     fault_injector_client: FaultInjectorClient,
     db_config: dict[str, Any],
@@ -222,8 +247,15 @@ def create_effect_database(
     is used as the injector supplies it - every slot-migrate dbconfig it serves is
     sharded, oss_cluster, and carries the standard hashtag shard_key_regex, which is
     what the channel-to-slot mapping in KeyGenerationHelpers.redis_slot relies on.
+
+    The port is the one value not taken as supplied. The injector serves a fixed port
+    per effect config, several configs share one, and Redis Enterprise still holds the
+    port of a database deleted seconds earlier, so a case whose predecessor used the
+    same port fails to provision with port_unavailable. The copy also keeps the port
+    off the parametrize dict, which the sync and async classes share.
     """
     delete_database_if_exists(fault_injector_client, db_config["name"])
+    db_config = {**db_config, "port": PUBSUB_DB_PORT_BASE + next_db_suffix()}
     endpoint_config = fault_injector_client.create_database(db_config)
     endpoint_config["shards_count"] = db_config["shards_count"]
     return endpoint_config
@@ -252,16 +284,19 @@ def dedupe_effect_params(
     return deduped
 
 
-def make_pubsub_db_config():
+def make_pubsub_db_config(shards_placement: str = SPARSE_SHARDS_PLACEMENT):
     """Build the database config the Pub/Sub scenarios need.
 
     Defined here rather than read from a bdb config file so the suite carries its own
     requirements: sharded, OSS-cluster API across every master shard, and a hashtag
-    shard_key_regex so channels can be pinned to a slot. Name and port carry a random
-    suffix, mirroring how the fault injector generates its own configs, so concurrent
-    runs cannot collide with each other or with a fault-injector database.
+    shard_key_regex so channels can be pinned to a slot. Name and port carry a suffix
+    unique to the run, mirroring how the fault injector generates its own configs, so
+    concurrent runs cannot collide with each other or with a fault-injector database.
+
+    shards_placement is a parameter because the two groups of scenarios want opposite
+    layouts; see the pubsub_shards_placement fixture and its override.
     """
-    suffix = random.randint(0, 999)
+    suffix = next_db_suffix()
     return {
         "name": f"pubsub-oss-api-{suffix}",
         "port": PUBSUB_DB_PORT_BASE + suffix,
@@ -269,7 +304,7 @@ def make_pubsub_db_config():
         "eviction_policy": "noeviction",
         "sharding": True,
         "shards_count": PUBSUB_TEST_SHARDS_COUNT,
-        "shards_placement": "sparse",
+        "shards_placement": shards_placement,
         "replication": True,
         "oss_cluster": True,
         "oss_cluster_api_preferred_ip_type": "external",
@@ -311,14 +346,26 @@ def get_cluster_client(
 
 
 @pytest.fixture()
+def pubsub_shards_placement():
+    """Shard placement for the database cluster_endpoint_config creates.
+
+    Sparse by default, so the shards spread over every node and a fault injected on any
+    one of them lands on this database. The migration scenarios need the opposite and
+    override this fixture per class.
+    """
+    return SPARSE_SHARDS_PLACEMENT
+
+
+@pytest.fixture()
 def cluster_endpoint_config(
     fault_injector_client_oss_api: FaultInjectorClient,
+    pubsub_shards_placement,
 ):
     """Create a Pub/Sub database for one test and delete it afterwards."""
     if isinstance(fault_injector_client_oss_api, ProxyServerFaultInjector):
         pytest.skip("mock proxy does not currently support Pub/Sub flows")
 
-    db_config = make_pubsub_db_config()
+    db_config = make_pubsub_db_config(shards_placement=pubsub_shards_placement)
 
     delete_database_if_exists(fault_injector_client_oss_api, db_config["name"])
     try:
@@ -798,6 +845,14 @@ async def async_run_sharded_pubsub_recovery_scenario(
 
 
 class TestShardedPubSubMigrationScenario:
+    @pytest.fixture()
+    def pubsub_shards_placement(self):
+        """Pack the shards so the migrate action has a node to migrate to.
+
+        See DENSE_SHARDS_PLACEMENT for why sparse leaves it without a target.
+        """
+        return DENSE_SHARDS_PLACEMENT
+
     @pytest.mark.timeout(MIGRATION_TEST_TIMEOUT)
     @pytest.mark.parametrize("subscriber_count", [1, 2])
     def test_sharded_pubsub_delivery_after_shard_migration(
@@ -851,6 +906,14 @@ class TestShardedPubSubInfrastructureRecovery:
 
 
 class TestAsyncShardedPubSubFaultInjectorMigrationScenario:
+    @pytest.fixture()
+    def pubsub_shards_placement(self):
+        """Pack the shards so the migrate action has a node to migrate to.
+
+        See DENSE_SHARDS_PLACEMENT for why sparse leaves it without a target.
+        """
+        return DENSE_SHARDS_PLACEMENT
+
     @pytest.mark.asyncio
     @pytest.mark.timeout(MIGRATION_TEST_TIMEOUT)
     @pytest.mark.parametrize("subscriber_count", [1, 2])
