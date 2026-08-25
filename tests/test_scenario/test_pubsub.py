@@ -34,13 +34,42 @@ from tests.test_scenario.maint_notifications_helpers import (
 
 
 POST_RECOVERY_DELIVERY_RATIO = 0.90
+# Messages a subscriber has to receive on a channel, out of those published after the
+# cluster operation, before the delivery-ratio window is allowed to open on it. The
+# window must not open while a subscriber is still reconnecting: Pub/Sub never replays
+# what was missed, so a window covering the reconnect gap makes the ratio below
+# unsatisfiable from the moment it is measured, and the test spends its whole recovery
+# budget on a foregone result instead of failing on what actually broke.
+DELIVERY_RESUMED_MESSAGES = 3
+# Messages per channel the window has to hold before the ratio is worth evaluating.
+# POST_RECOVERY_DELIVERY_RATIO of this is what a subscriber is allowed to miss.
+POST_RECOVERY_WINDOW_MESSAGES = 20
+# Subscriber read errors logged in full before sampling starts. A reconnect shows up as
+# a short burst, so sampling from the first error hides the very errors that explain it.
+SUBSCRIBER_ERROR_LOG_BURST = 5
+SUBSCRIBER_ERROR_LOG_INTERVAL = 10
 BASELINE_TIMEOUT = 30
 RECOVERY_TIMEOUT = 120
 SHARD_FAILURE_RECOVERY_TIMEOUT = 180
-# node_failure/reboot in the fault injector can wait up to 180s for shutdown
-# and 180s for startup before the action completes.
+# The poll budget for every failure scenario's fault-injector action. node_failure/reboot
+# is the widest of them: it can wait up to 180s for shutdown and 180s for startup before
+# the action completes. One budget covers them all because a poll is a ceiling on
+# failure, not a target - get_operation_result returns as soon as the action reaches a
+# completed status - and it has to outlast the injector's own server-side wait, which for
+# the shard failure is the active_timeout of SHARD_FAILURE_RECOVERY_TIMEOUT it is sent.
 INFRASTRUCTURE_ACTION_TIMEOUT = 360
-INFRASTRUCTURE_RECOVERY_TEST_TIMEOUT = 600
+# Worst case is the baseline wait, the fault injector's own wait, and the two
+# post-recovery waits run back to back - the same shape as EFFECT_TRIGGER_TEST_TIMEOUT
+# and MIGRATION_TEST_TIMEOUT below. Every failure scenario shares one injector budget, so
+# the shard failure dominates: recovery_timeout_for_failure gives it the longer
+# post-recovery wait. Derived from the parts rather than set to a round number so the cap
+# cannot silently fall behind them; it only bites on failure.
+INFRASTRUCTURE_RECOVERY_TEST_TIMEOUT = (
+    BASELINE_TIMEOUT
+    + INFRASTRUCTURE_ACTION_TIMEOUT
+    + 2 * SHARD_FAILURE_RECOVERY_TIMEOUT
+    + 120
+)
 PUBLISH_INTERVAL = 0.02
 PUBSUB_PROGRESS_LOG_MESSAGE_INTERVAL = 300
 PUBSUB_TEST_SHARDS_COUNT = 3
@@ -152,12 +181,6 @@ def recovery_timeout_for_failure(failure_name):
     return RECOVERY_TIMEOUT
 
 
-def action_timeout_for_failure(failure_name):
-    if failure_name == "shard_failure":
-        return RECOVERY_TIMEOUT
-    return INFRASTRUCTURE_ACTION_TIMEOUT
-
-
 def recovery_timeout_for_effect(effect_name):
     if effect_name == SlotMigrateEffects.SLOT_SHUFFLE:
         return RECOVERY_TIMEOUT
@@ -166,7 +189,6 @@ def recovery_timeout_for_effect(effect_name):
 
 def execute_failure_scenario(
     fault_injector_client: FaultInjectorClient,
-    failure_name,
     create_action,
     cluster_endpoint_config,
 ):
@@ -175,7 +197,7 @@ def execute_failure_scenario(
     )
     fault_injector_client.get_operation_result(
         result["action_id"],
-        timeout=action_timeout_for_failure(failure_name),
+        timeout=INFRASTRUCTURE_ACTION_TIMEOUT,
     )
 
 
@@ -428,6 +450,7 @@ def run_sharded_pubsub_scenario(
     received_messages = 0
     publish_errors = 0
     subscriber_errors = 0
+    last_logged_error_type = None
 
     logging.info(
         "Pub/Sub scenario started: channels=%s channels_per_shard=%s subscribers=%s",
@@ -449,11 +472,22 @@ def run_sharded_pubsub_scenario(
             )
 
     def handle_subscriber_error(error, pubsub, thread):
-        nonlocal subscriber_errors
+        nonlocal subscriber_errors, last_logged_error_type
+        error_type = type(error).__name__
         with state_lock:
             subscriber_errors += 1
             errors = subscriber_errors
-        if errors == 1 or errors % 10 == 0:
+            new_error_type = error_type != last_logged_error_type
+            if new_error_type:
+                last_logged_error_type = error_type
+        # Log the opening burst in full, then sample, and always log an error kind not
+        # seen before - a lone distinct error inside a flood of ConnectionErrors is
+        # what explains the flood, and sampling alone only shows it by luck.
+        if (
+            errors <= SUBSCRIBER_ERROR_LOG_BURST
+            or errors % SUBSCRIBER_ERROR_LOG_INTERVAL == 0
+            or new_error_type
+        ):
             logging.info(
                 "Pub/Sub subscriber read error: errors=%s error=%r",
                 errors,
@@ -568,31 +602,59 @@ def run_sharded_pubsub_scenario(
                 channel: set(seqs) for channel, seqs in sent_by_channel.items()
             }
 
-        def enough_messages_sent():
+        # Set by recovery_window_ready once delivery is observed live again, and the
+        # baseline the delivery ratio is measured against from then on. None until then.
+        measurement_baseline = None
+
+        def recovery_window_ready():
+            nonlocal measurement_baseline
             with state_lock:
-                return all(
-                    len(
-                        sent_by_channel[channel] - recovery_baseline.get(channel, set())
+                if measurement_baseline is not None:
+                    return all(
+                        len(sent_by_channel[channel] - measurement_baseline[channel])
+                        >= POST_RECOVERY_WINDOW_MESSAGES
+                        for channel in channels
                     )
-                    >= 20
-                    for channel in channels
-                )
+                # Every subscriber has to be receiving again on every channel before
+                # the window opens. Opening it on what the publisher sent instead - the
+                # publisher recovers first, and needs about a second to produce
+                # POST_RECOVERY_WINDOW_MESSAGES - puts the reconnect gap inside the
+                # window, and those messages are gone for good.
+                for channel in channels:
+                    published = sent_by_channel[channel] - recovery_baseline.get(
+                        channel, set()
+                    )
+                    for subscriber in received_by_subscriber:
+                        if (
+                            len(subscriber[channel] & published)
+                            < DELIVERY_RESUMED_MESSAGES
+                        ):
+                            return False
+                measurement_baseline = {
+                    channel: set(sent_by_channel[channel]) for channel in channels
+                }
+            logging.info("Pub/Sub delivery resumed: %s", progress_message())
+            return False
 
         try:
             wait_for_condition(
-                enough_messages_sent,
+                recovery_window_ready,
                 timeout=recovery_timeout,
                 check_interval=0.1,
-                error_message="Timed out waiting for post-recovery messages to be sent",
+                error_message="Timed out waiting for the post-recovery window",
             )
         except AssertionError as error:
-            raise AssertionError(f"{error}; {progress_message()}") from error
-        logging.info("Pub/Sub post-recovery publishes reached: %s", progress_message())
+            stage = (
+                "delivery never resumed"
+                if measurement_baseline is None
+                else "window never filled"
+            )
+            raise AssertionError(f"{error} ({stage}); {progress_message()}") from error
+        logging.info("Pub/Sub post-recovery window ready: %s", progress_message())
 
         with state_lock:
             sent_after_recovery = {
-                channel: sent_by_channel[channel]
-                - recovery_baseline.get(channel, set())
+                channel: sent_by_channel[channel] - measurement_baseline[channel]
                 for channel in channels
             }
 
@@ -655,6 +717,7 @@ async def async_run_sharded_pubsub_recovery_scenario(
     received_messages = 0
     publish_errors = 0
     subscriber_errors = 0
+    last_logged_error_type = None
 
     logging.info(
         "Async Pub/Sub scenario started: channels=%s channels_per_shard=%s "
@@ -676,9 +739,20 @@ async def async_run_sharded_pubsub_recovery_scenario(
     def handle_subscriber_error(error):
         # No lock, unlike the sync twin: every reader runs on the one event loop, so
         # the increment cannot interleave with another reader's.
-        nonlocal subscriber_errors
+        nonlocal subscriber_errors, last_logged_error_type
         subscriber_errors += 1
-        if subscriber_errors == 1 or subscriber_errors % 10 == 0:
+        error_type = type(error).__name__
+        new_error_type = error_type != last_logged_error_type
+        if new_error_type:
+            last_logged_error_type = error_type
+        # Log the opening burst in full, then sample, and always log an error kind not
+        # seen before - a lone distinct error inside a flood of ConnectionErrors is
+        # what explains the flood, and sampling alone only shows it by luck.
+        if (
+            subscriber_errors <= SUBSCRIBER_ERROR_LOG_BURST
+            or subscriber_errors % SUBSCRIBER_ERROR_LOG_INTERVAL == 0
+            or new_error_type
+        ):
             logging.info(
                 "Async Pub/Sub subscriber read error: errors=%s error=%r",
                 subscriber_errors,
@@ -786,29 +860,57 @@ async def async_run_sharded_pubsub_recovery_scenario(
             channel: set(seqs) for channel, seqs in sent_by_channel.items()
         }
 
-        def enough_messages_sent():
-            return all(
-                len(sent_by_channel[channel] - recovery_baseline.get(channel, set()))
-                >= 20
-                for channel in channels
-            )
+        # Set by recovery_window_ready once delivery is observed live again, and the
+        # baseline the delivery ratio is measured against from then on. None until then.
+        measurement_baseline = None
+
+        def recovery_window_ready():
+            nonlocal measurement_baseline
+            if measurement_baseline is not None:
+                return all(
+                    len(sent_by_channel[channel] - measurement_baseline[channel])
+                    >= POST_RECOVERY_WINDOW_MESSAGES
+                    for channel in channels
+                )
+            # Every subscriber has to be receiving again on every channel before the
+            # window opens. Opening it on what the publisher sent instead - the
+            # publisher recovers first, and needs about a second to produce
+            # POST_RECOVERY_WINDOW_MESSAGES - puts the reconnect gap inside the window,
+            # and those messages are gone for good.
+            for channel in channels:
+                published = sent_by_channel[channel] - recovery_baseline.get(
+                    channel, set()
+                )
+                for subscriber in received_by_subscriber:
+                    if len(subscriber[channel] & published) < DELIVERY_RESUMED_MESSAGES:
+                        return False
+            measurement_baseline = {
+                channel: set(sent_by_channel[channel]) for channel in channels
+            }
+            logging.info("Async Pub/Sub delivery resumed: %s", progress_message())
+            return False
 
         try:
             await async_wait_for_condition(
-                enough_messages_sent,
+                recovery_window_ready,
                 timeout=recovery_timeout,
                 check_interval=0.1,
-                error_message="Timed out waiting for post-recovery messages to be sent",
+                error_message="Timed out waiting for the post-recovery window",
             )
         except AssertionError as error:
-            raise AssertionError(f"{error}; {progress_message()}") from error
+            stage = (
+                "delivery never resumed"
+                if measurement_baseline is None
+                else "window never filled"
+            )
+            raise AssertionError(f"{error} ({stage}); {progress_message()}") from error
         logging.info(
-            "Async Pub/Sub post-recovery publishes reached: %s",
+            "Async Pub/Sub post-recovery window ready: %s",
             progress_message(),
         )
 
         sent_after_recovery = {
-            channel: sent_by_channel[channel] - recovery_baseline.get(channel, set())
+            channel: sent_by_channel[channel] - measurement_baseline[channel]
             for channel in channels
         }
 
@@ -890,7 +992,6 @@ class TestShardedPubSubInfrastructureRecovery:
         def inject_failure():
             execute_failure_scenario(
                 fault_injector_client_oss_api,
-                failure_name,
                 create_action,
                 cluster_endpoint_config,
             )
@@ -953,7 +1054,6 @@ class TestAsyncShardedPubSubInfrastructureRecovery:
         def inject_failure():
             execute_failure_scenario(
                 fault_injector_client_oss_api,
-                failure_name,
                 create_action,
                 cluster_endpoint_config,
             )

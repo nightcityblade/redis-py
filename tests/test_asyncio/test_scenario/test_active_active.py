@@ -20,6 +20,43 @@ from tests.test_scenario.fault_injector_client import ActionRequest, ActionType
 
 logger = logging.getLogger(__name__)
 
+# The Redis Enterprise REST API credentials LagAwareHealthCheck authenticates with.
+# They come from the test environment, and without them every probe gets HTTP 401 and
+# both databases are reported unhealthy - which fails the initial health check instead
+# of exercising the health check the test is about.
+LAG_AWARE_CREDENTIAL_ENV_VARS = ("ENV0_USERNAME", "ENV0_PASSWORD")
+
+
+def lag_aware_auth_basic():
+    """
+    Return the REST API credentials for LagAwareHealthCheck as the environment
+    supplies them.
+    """
+    return tuple(os.getenv(name) for name in LAG_AWARE_CREDENTIAL_ENV_VARS)
+
+
+def require_lag_aware_credentials():
+    """
+    Fail the calling test up front when the environment does not supply the REST API
+    credentials.
+
+    Deliberately a failure and not a skip: a skipped test is invisible in a scenario
+    run's log, and the alternative is every probe returning HTTP 401 and the run
+    reporting InitialHealthCheckFailedError, which reads like a client bug.
+
+    Kept apart from lag_aware_auth_basic because the health check here is built at
+    collection time, where failing the individual test is not available.
+    """
+    missing = ", ".join(
+        name for name in LAG_AWARE_CREDENTIAL_ENV_VARS if not os.getenv(name)
+    )
+
+    if missing:
+        pytest.fail(
+            "LagAwareHealthCheck requires the Redis Enterprise REST API credentials "
+            f"in {missing}. Set them from the CI secrets of the same name."
+        )
+
 
 async def trigger_network_failure_action(
     fault_injector_client, config, event: asyncio.Event = None
@@ -114,10 +151,7 @@ class TestActiveActive:
                 "health_checks": [
                     LagAwareHealthCheck(
                         verify_tls=False,
-                        auth_basic=(
-                            os.getenv("ENV0_USERNAME"),
-                            os.getenv("ENV0_PASSWORD"),
-                        ),
+                        auth_basic=lag_aware_auth_basic(),
                     )
                 ],
                 "health_check_interval": 20,
@@ -128,10 +162,7 @@ class TestActiveActive:
                 "health_checks": [
                     LagAwareHealthCheck(
                         verify_tls=False,
-                        auth_basic=(
-                            os.getenv("ENV0_USERNAME"),
-                            os.getenv("ENV0_PASSWORD"),
-                        ),
+                        auth_basic=lag_aware_auth_basic(),
                     )
                 ],
                 "health_check_interval": 20,
@@ -144,6 +175,8 @@ class TestActiveActive:
     async def test_multi_db_client_uses_lag_aware_health_check(
         self, r_multi_db, fault_injector_client
     ):
+        require_lag_aware_credentials()
+
         client, listener, endpoint_config = r_multi_db
         retry = Retry(
             supported_errors=(TemporaryUnavailableException,),
