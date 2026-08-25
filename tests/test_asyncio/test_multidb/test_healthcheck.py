@@ -3,6 +3,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from redis.asyncio.cluster import ClusterNode as AsyncClusterNode
+from redis.asyncio.cluster import RedisCluster as AsyncRedisCluster
 from redis.asyncio.multidb.database import Database
 from redis.asyncio.multidb.healthcheck import (
     PingHealthCheck,
@@ -16,6 +18,21 @@ from redis.http.http_client import HttpError
 from redis.multidb.circuit import State as CBState
 from redis.exceptions import ConnectionError
 from redis.multidb.exception import UnhealthyDatabaseException
+
+
+def _mock_cluster_node(ping_result=True):
+    """Mock of an async cluster node, bound to the real ``ClusterNode`` interface."""
+    node = Mock(spec=AsyncClusterNode)
+    node.execute_command = AsyncMock(return_value=ping_result)
+    return node
+
+
+def _mock_cluster_client(*nodes):
+    """Mock of an async cluster client, bound to the real ``RedisCluster`` interface."""
+    client = Mock(spec=AsyncRedisCluster)
+    client.initialize = AsyncMock(return_value=client)
+    client.get_nodes = Mock(return_value=list(nodes))
+    return client
 
 
 def _configure_mock_health_check(mock_hc, probes=3, delay=0.01, timeout=1.0):
@@ -327,26 +344,10 @@ class TestPingHealthCheck:
         """
         Verify that PingHealthCheck returns True for cluster when all nodes respond.
         """
-        from redis.asyncio.cluster import RedisCluster as AsyncRedisCluster
-
-        # Create mock nodes
-        mock_node1 = Mock()
-        mock_node1.redis_connection = AsyncMock()
-        mock_node1.redis_connection.execute_command = AsyncMock(return_value=True)
-
-        mock_node2 = Mock()
-        mock_node2.redis_connection = AsyncMock()
-        mock_node2.redis_connection.execute_command = AsyncMock(return_value=True)
-
-        mock_node3 = Mock()
-        mock_node3.redis_connection = AsyncMock()
-        mock_node3.redis_connection.execute_command = AsyncMock(return_value=True)
-
-        # Create mock cluster client (not AsyncRedis, so isinstance check fails)
-        mock_hc_client = Mock(spec=AsyncRedisCluster)
-        mock_hc_client.get_nodes = Mock(
-            return_value=[mock_node1, mock_node2, mock_node3]
-        )
+        mock_node1 = _mock_cluster_node(ping_result=True)
+        mock_node2 = _mock_cluster_node(ping_result=True)
+        mock_node3 = _mock_cluster_node(ping_result=True)
+        mock_hc_client = _mock_cluster_client(mock_node1, mock_node2, mock_node3)
 
         hc = PingHealthCheck()
         db = Database(mock_client, mock_cb, 0.9)
@@ -354,9 +355,9 @@ class TestPingHealthCheck:
         assert await hc.check_health(db, mock_hc_client)
 
         # All nodes should have been pinged
-        mock_node1.redis_connection.execute_command.assert_called_once_with("PING")
-        mock_node2.redis_connection.execute_command.assert_called_once_with("PING")
-        mock_node3.redis_connection.execute_command.assert_called_once_with("PING")
+        mock_node1.execute_command.assert_awaited_once_with("PING")
+        mock_node2.execute_command.assert_awaited_once_with("PING")
+        mock_node3.execute_command.assert_awaited_once_with("PING")
 
     @pytest.mark.asyncio
     async def test_cluster_database_is_unhealthy_when_one_node_fails(
@@ -365,26 +366,11 @@ class TestPingHealthCheck:
         """
         Verify that PingHealthCheck returns False for cluster when any node fails.
         """
-        from redis.asyncio.cluster import RedisCluster as AsyncRedisCluster
-
-        # Create mock nodes - second node fails
-        mock_node1 = Mock()
-        mock_node1.redis_connection = AsyncMock()
-        mock_node1.redis_connection.execute_command = AsyncMock(return_value=True)
-
-        mock_node2 = Mock()
-        mock_node2.redis_connection = AsyncMock()
-        mock_node2.redis_connection.execute_command = AsyncMock(return_value=False)
-
-        mock_node3 = Mock()
-        mock_node3.redis_connection = AsyncMock()
-        mock_node3.redis_connection.execute_command = AsyncMock(return_value=True)
-
-        # Create mock cluster client
-        mock_hc_client = Mock(spec=AsyncRedisCluster)
-        mock_hc_client.get_nodes = Mock(
-            return_value=[mock_node1, mock_node2, mock_node3]
-        )
+        # Second node fails
+        mock_node1 = _mock_cluster_node(ping_result=True)
+        mock_node2 = _mock_cluster_node(ping_result=False)
+        mock_node3 = _mock_cluster_node(ping_result=True)
+        mock_hc_client = _mock_cluster_client(mock_node1, mock_node2, mock_node3)
 
         hc = PingHealthCheck()
         db = Database(mock_client, mock_cb, 0.9)
@@ -392,10 +378,53 @@ class TestPingHealthCheck:
         assert not await hc.check_health(db, mock_hc_client)
 
         # Should stop after the failing node
-        mock_node1.redis_connection.execute_command.assert_called_once_with("PING")
-        mock_node2.redis_connection.execute_command.assert_called_once_with("PING")
+        mock_node1.execute_command.assert_awaited_once_with("PING")
+        mock_node2.execute_command.assert_awaited_once_with("PING")
         # Node 3 should not be checked (early exit on failure)
-        mock_node3.redis_connection.execute_command.assert_not_called()
+        mock_node3.execute_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cluster_health_check_client_is_initialized_before_ping(
+        self, mock_client, mock_cb
+    ):
+        """
+        Verify that the cluster topology is discovered before the nodes are pinged.
+
+        The health check client is created lazily, so without an explicit
+        initialization its node cache is empty.
+        """
+        mock_node = _mock_cluster_node(ping_result=True)
+        mock_hc_client = _mock_cluster_client()
+        # Empty node cache until the client has been initialized.
+        nodes = []
+        mock_hc_client.get_nodes = Mock(side_effect=lambda: nodes)
+        mock_hc_client.initialize.side_effect = lambda: nodes.append(mock_node)
+
+        hc = PingHealthCheck()
+        db = Database(mock_client, mock_cb, 0.9)
+
+        assert await hc.check_health(db, mock_hc_client)
+
+        mock_hc_client.initialize.assert_awaited_once()
+        mock_node.execute_command.assert_awaited_once_with("PING")
+
+    @pytest.mark.asyncio
+    async def test_cluster_database_is_unhealthy_when_no_nodes_are_known(
+        self, mock_client, mock_cb
+    ):
+        """
+        Verify that a cluster with an empty node cache is reported as unhealthy.
+
+        Without this, there would be nothing to ping and the database would be
+        reported as healthy without a single successful probe.
+        """
+        mock_hc_client = _mock_cluster_client()
+
+        hc = PingHealthCheck()
+        db = Database(mock_client, mock_cb, 0.9)
+
+        assert not await hc.check_health(db, mock_hc_client)
+        mock_hc_client.initialize.assert_awaited_once()
 
 
 @pytest.mark.onlynoncluster

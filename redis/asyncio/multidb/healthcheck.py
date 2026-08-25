@@ -386,9 +386,18 @@ class PingHealthCheck(AbstractHealthCheck):
             return await hc_client.execute_command("PING")
         else:
             # For a cluster checks if all nodes are healthy.
+            # The health check client is created lazily, so the topology has to be
+            # discovered before pinging - an uninitialized client has an empty node
+            # cache, so there would be nothing to ping and the database would be
+            # reported as healthy. Once discovered, this is a no-op.
+            await hc_client.initialize()
             all_nodes = hc_client.get_nodes()
+
+            if not all_nodes:
+                return False
+
             for node in all_nodes:
-                if not await node.redis_connection.execute_command("PING"):
+                if not await node.execute_command("PING"):
                     return False
 
             return True

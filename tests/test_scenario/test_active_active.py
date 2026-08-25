@@ -44,7 +44,6 @@ def trigger_network_failure_action(
     logger.info(f"Action completed. Status: {status_result['status']}")
 
 
-# pytest.mark.skip(reason="Temporarily disabled")
 class TestActiveActive:
     def teardown_method(self, method):
         # Timeout so the cluster could recover from network failure.
@@ -277,12 +276,12 @@ class TestActiveActive:
         # Execute pipeline before network failure
         while not event.is_set():
             retry.call_with_retry(lambda: callback(), lambda _: dummy_fail())
-        sleep(0.5)
+            sleep(0.5)
 
         # Execute pipeline until database failover
         for _ in range(5):
             retry.call_with_retry(lambda: callback(), lambda _: dummy_fail())
-        sleep(0.5)
+            sleep(0.5)
 
     @pytest.mark.parametrize(
         "r_multi_db",
