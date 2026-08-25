@@ -69,6 +69,27 @@ DEFAULT_OSS_API_CLIENT_SOCKET_TIMEOUT = 1
 
 
 class TestAsyncPushNotificationsBase:
+    def _fail_on_command_errors(self, errors, source: str):
+        """Drain the collected command errors and fail with all of them printed.
+
+        Every error is logged individually before failing: pytest truncates long
+        assertion messages, so a run with many failures would otherwise hide most
+        of them behind "...Full output truncated". The failure message keeps a
+        short preview and points at the log for the rest.
+        """
+        collected = []
+        while not errors.empty():
+            collected.append(errors.get_nowait())
+        if not collected:
+            return
+        logging.error(f"{len(collected)} error(s) collected from {source}:")
+        for index, error in enumerate(collected, start=1):
+            logging.error(f"  [{index}/{len(collected)}] {error}")
+        preview = "; ".join(collected[:5])
+        if len(collected) > 5:
+            preview += f"; ... ({len(collected) - 5} more, see the log above)"
+        pytest.fail(f"{len(collected)} error(s) occurred in {source}: {preview}")
+
     async def _get_all_connections_in_pool(self, client: Redis) -> List:
         connections = []
         async with client.connection_pool._get_pool_lock():
@@ -881,10 +902,7 @@ class TestAsyncStandaloneClientPushNotificationsHandlingWithEffectTrigger(
                     assert conn.host != conn.orig_host_address
                 assert not conn.should_reconnect()
 
-        error_items = []
-        while not errors.empty():
-            error_items.append(errors.get_nowait())
-        assert not error_items, f"Errors occurred in tasks: {error_items}"
+        self._fail_on_command_errors(errors, "command execution tasks")
 
         await trigger_task
         self.maintenance_ops_tasks.remove(trigger_task)
@@ -1204,10 +1222,7 @@ class TestAsyncStandaloneClientCommandsExecutionWithPushNotificationsWithEffectT
             configured_timeout=DEFAULT_STANDALONE_CLIENT_SOCKET_TIMEOUT,
         )
 
-        error_items = []
-        while not errors.empty():
-            error_items.append(errors.get_nowait())
-        assert not error_items, f"Errors occurred in tasks: {error_items}"
+        self._fail_on_command_errors(errors, "command execution tasks")
 
 
 class TestAsyncClusterClientPushNotificationsWithEffectTriggerBase(
@@ -1821,7 +1836,4 @@ class TestAsyncClusterClientCommandsExecutionWithPushNotificationsWithEffectTrig
             logging.info(f"Consumed all buffers for node: {node.name}")
         logging.info("All buffers consumed.")
 
-        error_items = []
-        while not errors.empty():
-            error_items.append(errors.get_nowait())
-        assert not error_items, f"Errors occurred in tasks: {error_items}"
+        self._fail_on_command_errors(errors, "command execution tasks")

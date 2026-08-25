@@ -2801,6 +2801,11 @@ class NodesManager:
                         else:
                             startup_node.redis_connection = r
                     try:
+                        if is_debug_log_enabled():
+                            logger.debug(
+                                "Topology refresh: querying CLUSTER SLOTS on "
+                                f"{startup_node.name}"
+                            )
                         # Make sure cluster mode is enabled on this node
                         cluster_slots = str_if_bytes(r.execute_command("CLUSTER SLOTS"))
                         if disconnect_startup_nodes_pools:
@@ -2819,6 +2824,11 @@ class NodesManager:
                 except Exception as e:
                     # Try the next startup node.
                     # The exception is saved and raised only if we have no more nodes.
+                    if is_debug_log_enabled():
+                        logger.debug(
+                            "Topology refresh: CLUSTER SLOTS failed on "
+                            f"{startup_node.name}: {type(e).__name__}: {e}"
+                        )
                     exception = e
                     continue
 
@@ -2880,6 +2890,12 @@ class NodesManager:
                                     )
 
                 fully_covered = self.check_slots_coverage(tmp_slots)
+                if is_debug_log_enabled():
+                    logger.debug(
+                        f"Topology refresh: CLUSTER SLOTS from {startup_node.name} "
+                        f"reported nodes {sorted(tmp_nodes_cache)}; "
+                        f"slots fully covered: {fully_covered}"
+                    )
                 if fully_covered:
                     # Don't need to continue to the next startup node if all
                     # slots are covered

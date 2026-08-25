@@ -94,6 +94,27 @@ class TestPushNotificationsBase:
     operations.
     """
 
+    def _fail_on_command_errors(self, errors, source: str):
+        """Drain the collected command errors and fail with all of them printed.
+
+        Every error is logged individually before failing: pytest truncates long
+        assertion messages, so a run with many failures would otherwise hide most
+        of them behind "...Full output truncated". The failure message keeps a
+        short preview and points at the log for the rest.
+        """
+        collected = []
+        while not errors.empty():
+            collected.append(errors.get_nowait())
+        if not collected:
+            return
+        logging.error(f"{len(collected)} error(s) collected from {source}:")
+        for index, error in enumerate(collected, start=1):
+            logging.error(f"  [{index}/{len(collected)}] {error}")
+        preview = "; ".join(collected[:5])
+        if len(collected) > 5:
+            preview += f"; ... ({len(collected) - 5} more, see the log above)"
+        pytest.fail(f"{len(collected)} error(s) occurred in {source}: {preview}")
+
     def delete_prev_db(
         self,
         fault_injector_client: FaultInjectorClient,
@@ -1039,7 +1060,7 @@ class TestStandaloneClientPushNotificationsHandlingWithEffectTrigger(
                 assert not conn.should_reconnect()
 
         # validate no errors were raised in the command execution threads
-        assert errors.empty(), f"Errors occurred in threads: {errors.queue}"
+        self._fail_on_command_errors(errors, "command execution threads")
 
         trigger_effect_thread.join()
         self.maintenance_ops_threads.remove(trigger_effect_thread)
@@ -1398,7 +1419,7 @@ class TestStandaloneClientCommandsExecutionWithPushNotificationsWithEffectTrigge
             configured_timeout=DEFAULT_STANDALONE_CLIENT_SOCKET_TIMEOUT,
         )
 
-        assert errors.empty(), f"Errors occurred in threads: {errors.queue}"
+        self._fail_on_command_errors(errors, "command execution threads")
 
 
 class TestClusterClientPushNotificationsWithEffectTriggerBase(
@@ -2299,4 +2320,4 @@ class TestClusterClientCommandsExecutionWithPushNotificationsWithEffectTrigger(
             )
 
         # validate no errors were raised in the command execution threads
-        assert errors.empty(), f"Errors occurred in threads: {errors.queue}"
+        self._fail_on_command_errors(errors, "command execution threads")
