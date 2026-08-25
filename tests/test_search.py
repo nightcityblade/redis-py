@@ -1601,17 +1601,23 @@ class TestBaseSearchFunctionality(SearchTestsBase):
         client.hset("hset:1", "txt", "a")
         client.hset("hset:2", "txt", "b")
         client.hset("hset:3", "txt", "c")
+        # Keep searching until the expiration window of hset:2 has passed. The
+        # loop is bounded by elapsed time rather than by a fixed iteration count,
+        # so it covers the same window without depending on how long a single
+        # search round trip takes.
         if expects_resp2_shape(client) or expects_unified_shape(client):
             assert 3 == client.ft().search(Query("*")).total
             client.pexpire("hset:2", 300)
-            for _ in range(500):
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
                 client.ft().search(Query("*")).docs[1]
             time.sleep(1)
             assert 2 == client.ft().search(Query("*")).total
         elif expects_resp3_shape(client):
             assert 3 == client.ft().search(Query("*"))["total_results"]
             client.pexpire("hset:2", 300)
-            for _ in range(500):
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
                 client.ft().search(Query("*"))["results"][1]
             time.sleep(1)
             assert 2 == client.ft().search(Query("*"))["total_results"]
