@@ -67,6 +67,12 @@ DEFAULT_BIND_TTL = 15
 DEFAULT_STANDALONE_CLIENT_SOCKET_TIMEOUT = 1
 DEFAULT_OSS_API_CLIENT_SOCKET_TIMEOUT = 1
 
+# The fault injector's create_database can fail on transient cluster-side infrastructure
+# problems - a DNS blip while it polls the cluster REST API, for example - that say nothing
+# about the client under test. Retrying the setup keeps such a blip from being reported as a
+# test failure.
+DB_CREATE_ATTEMPTS = 3
+
 
 class TestAsyncPushNotificationsBase:
     def _fail_on_command_errors(self, errors, source: str):
@@ -247,7 +253,10 @@ class TestAsyncPushNotificationsBase:
                 logging.info(f"Deleted database: {db_name}")
             else:
                 logging.info(f"Database {db_name} does not exist.")
-        except Exception as e:
+        # _get_cluster_nodes_info reports failures through pytest.fail, which does not
+        # derive from Exception - catch it too, so deleting a leftover DB stays best
+        # effort and never aborts the caller.
+        except (Exception, pytest.fail.Exception) as e:
             logging.error(f"Failed to delete database {db_name}: {e}")
 
     async def create_db(
@@ -255,14 +264,28 @@ class TestAsyncPushNotificationsBase:
         fault_injector_client: AsyncFaultInjectorClient,
         bdb_config: Dict[str, Any],
     ):
-        try:
-            logging.info(f"Creating database: \n{json.dumps(bdb_config, indent=2)}")
-            cluster_endpoint_config = await fault_injector_client.create_database(
-                bdb_config
-            )
-            return cluster_endpoint_config
-        except Exception as e:
-            pytest.fail(f"Failed to create database: {e}")
+        """Create the test database, retrying transient infrastructure failures.
+
+        A create that fails midway can still leave the BDB on the cluster, so any
+        leftover is deleted by name before the next attempt - otherwise the retry
+        collides with it on the fixed port from the config.
+        """
+        logging.info(f"Creating database: \n{json.dumps(bdb_config, indent=2)}")
+        for attempt in range(1, DB_CREATE_ATTEMPTS + 1):
+            try:
+                return await fault_injector_client.create_database(bdb_config)
+            # get_operation_result reports a failed action through pytest.fail, which
+            # does not derive from Exception.
+            except (Exception, pytest.fail.Exception) as e:
+                if attempt == DB_CREATE_ATTEMPTS:
+                    pytest.fail(
+                        f"Failed to create database after {attempt} attempts: {e}"
+                    )
+                logging.warning(
+                    f"Attempt {attempt}/{DB_CREATE_ATTEMPTS} to create database "
+                    f"{bdb_config['name']} failed: {e}"
+                )
+                await self.delete_prev_db(fault_injector_client, bdb_config["name"])
 
     async def _trigger_effect(
         self,
@@ -302,8 +325,9 @@ class TestAsyncStandaloneClientPushNotificationsWithEffectTriggerBase(
         self._fault_injector = fault_injector_client
         await self.delete_prev_db(fault_injector_client, db_config["name"])
 
-        db_endpoint_config = await self.create_db(fault_injector_client, db_config)
+        # Recorded before the create so teardown removes a partially created DB.
         self._bdb_name = db_config["name"]
+        db_endpoint_config = await self.create_db(fault_injector_client, db_config)
 
         auth_ssl_client_certs_config_info = db_config.get(
             "authentication_ssl_client_certs", None
@@ -1042,8 +1066,9 @@ class TestAsyncStandaloneClientPushNotificationsHandlingWithEffectTrigger(
 
         self._fault_injector = fault_injector_client
         await self.delete_prev_db(fault_injector_client, db_config["name"])
-        db_endpoint_config = await self.create_db(fault_injector_client, db_config)
+        # Recorded before the create so teardown removes a partially created DB.
         self._bdb_name = db_config["name"]
+        db_endpoint_config = await self.create_db(fault_injector_client, db_config)
 
         logging.info("Creating client with disabled notifications.")
         self._client = client = get_async_standalone_client_maint_notifications(
@@ -1236,8 +1261,9 @@ class TestAsyncClusterClientPushNotificationsWithEffectTriggerBase(
         self._fault_injector = fault_injector_client
         await self.delete_prev_db(fault_injector_client, db_config["name"])
 
-        cluster_endpoint_config = await self.create_db(fault_injector_client, db_config)
+        # Recorded before the create so teardown removes a partially created DB.
         self._bdb_name = db_config["name"]
+        cluster_endpoint_config = await self.create_db(fault_injector_client, db_config)
 
         socket_timeout = DEFAULT_OSS_API_CLIENT_SOCKET_TIMEOUT
         socket_connect_timeout = DEFAULT_OSS_API_CLIENT_SOCKET_TIMEOUT
