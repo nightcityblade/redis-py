@@ -495,6 +495,67 @@ def test_socket_buffer_timeout_zero_maps_would_block_to_timeout():
         socket_buffer.readline(timeout=0)
 
 
+def test_socket_buffer_read_after_close_raises_connection_error():
+    """
+    A read on a closed buffer reports a gone connection.
+
+    ``close()`` runs on whichever thread tears the connection down - the
+    multi-database client closes connections from its health check thread - so a
+    command thread can reach these reads after it. ConnectionError is what the retry
+    and failover layers act on; ``ValueError: I/O operation on closed file`` escapes
+    them and surfaces at the caller of the command.
+    """
+    socket_buffer = SocketBuffer(Mock(), socket_read_size=65536, socket_timeout=None)
+    socket_buffer.close()
+
+    with pytest.raises(ConnectionError):
+        socket_buffer.readline()
+
+    with pytest.raises(ConnectionError):
+        socket_buffer.read(1)
+
+    with pytest.raises(ConnectionError):
+        socket_buffer.get_pos()
+
+    with pytest.raises(ConnectionError):
+        socket_buffer.unread_bytes()
+
+
+def test_socket_buffer_read_reports_concurrent_close_as_connection_error():
+    """
+    A close that lands while the read is blocked in recv reports a gone connection.
+
+    This is the window the test above cannot cover: the buffer is open when the read
+    starts and closed by the time the data comes back.
+    """
+    sock = Mock()
+    socket_buffer = SocketBuffer(sock, socket_read_size=65536, socket_timeout=None)
+
+    def close_then_answer(_):
+        socket_buffer.close()
+        return b"+OK\r\n"
+
+    sock.recv.side_effect = close_then_answer
+
+    with pytest.raises(ConnectionError):
+        socket_buffer.readline()
+
+
+def test_socket_buffer_cleanup_after_close_does_not_raise():
+    """
+    ``purge`` and ``rewind`` stay best effort on a closed buffer.
+
+    Both run after a read has already produced its outcome - a parsed response for
+    purge, an exception being unwound for rewind - so a connection closed underneath
+    them has nothing left to do and nothing to report.
+    """
+    socket_buffer = SocketBuffer(Mock(), socket_read_size=65536, socket_timeout=None)
+    socket_buffer.close()
+
+    socket_buffer.purge()
+    socket_buffer.rewind(0)
+
+
 @skip_if_server_version_lt("4.0.0")
 @pytest.mark.redismod
 def test_loading_external_modules(r):

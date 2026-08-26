@@ -40,6 +40,12 @@ FAILOVER_TIMEOUT_MESSAGE = (
 # both databases are reported unhealthy - which fails the initial health check instead
 # of exercising the health check the test is about.
 LAG_AWARE_CREDENTIAL_ENV_VARS = ("ENV0_USERNAME", "ENV0_PASSWORD")
+# The whole health check - every probe of it - has to finish inside this budget, and
+# each probe of this one is two REST calls to the Redis Enterprise API. The default of
+# 3 seconds covers a PING, not 3 probes x 2 requests over the public internet with a
+# second of it spent in the delay between probes, and running out of it reports the
+# database as unhealthy.
+LAG_AWARE_HEALTH_CHECK_TIMEOUT = 10
 
 
 def lag_aware_auth_basic():
@@ -206,6 +212,7 @@ class TestActiveActive:
                 verify_tls=False,
                 auth_basic=lag_aware_auth_basic(),
                 lag_aware_tolerance=10000,
+                health_check_timeout=LAG_AWARE_HEALTH_CHECK_TIMEOUT,
             )
         )
 

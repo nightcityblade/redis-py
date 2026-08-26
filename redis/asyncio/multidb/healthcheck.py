@@ -467,6 +467,48 @@ class LagAwareHealthCheck(AbstractHealthCheck):
             health_check_timeout=health_check_timeout,
         )
 
+    @staticmethod
+    def _database_hosts(database) -> set[str]:
+        """
+        The hosts the given database is known by on the Redis Enterprise REST API.
+
+        For a cluster client these are the endpoints the client was configured with,
+        not the nodes it discovered: CLUSTER SLOTS advertises each node's own address,
+        which on a public Redis Enterprise endpoint is neither the endpoint DNS name
+        nor an address the bdb lists. ``startup_nodes`` is read off the client rather
+        than off its nodes manager, because the latter is replaced by the discovered
+        nodes when ``dynamic_startup_nodes`` is enabled, as it is by default.
+        """
+        if isinstance(database.client, (AsyncRedis, SyncRedis)):
+            return {database.client.get_connection_kwargs()["host"]}
+
+        # Cluster client
+        return {node.host for node in database.client.startup_nodes}
+
+    @staticmethod
+    def _find_matching_bdb(bdbs, db_hosts: set[str]) -> Optional[dict]:
+        """
+        The bdb whose endpoints identify one of the given database hosts.
+
+        A DNS name belongs to a single bdb, while databases hosted by the same cluster
+        share the addresses their endpoints resolve to, so a match by DNS name is
+        preferred over a match by address across all of the bdbs.
+        """
+        addr_match = None
+
+        for bdb in bdbs:
+            for endpoint in bdb["endpoints"]:
+                if endpoint["dns_name"] in db_hosts:
+                    return bdb
+
+                # In case if the host was set as public IP
+                if addr_match is None and any(
+                    addr in db_hosts for addr in endpoint["addr"]
+                ):
+                    addr_match = bdb
+
+        return addr_match
+
     async def check_health(self, database, hc_client: AsyncRedisClientT) -> bool:
         """
         Check database health via Redis Enterprise REST API.
@@ -480,31 +522,21 @@ class LagAwareHealthCheck(AbstractHealthCheck):
                 "Database health check url is not set. Please check DatabaseConfig for the current database."
             )
 
-        if isinstance(database.client, (AsyncRedis, SyncRedis)):
-            db_host = database.client.get_connection_kwargs()["host"]
-        else:
-            # Cluster client
-            db_host = database.client.get_nodes()[0].host
+        db_hosts = self._database_hosts(database)
 
         base_url = f"{database.health_check_url}:{self._rest_api_port}"
         self._http_client.client.base_url = base_url
 
         # Find bdb matching to the current database host
-        matching_bdb = None
-        for bdb in await self._http_client.get("/v1/bdbs"):
-            for endpoint in bdb["endpoints"]:
-                if endpoint["dns_name"] == db_host:
-                    matching_bdb = bdb
-                    break
-
-                # In case if the host was set as public IP
-                for addr in endpoint["addr"]:
-                    if addr == db_host:
-                        matching_bdb = bdb
-                        break
+        matching_bdb = self._find_matching_bdb(
+            await self._http_client.get("/v1/bdbs"), db_hosts
+        )
 
         if matching_bdb is None:
-            logger.warning("LagAwareHealthCheck failed: Couldn't find a matching bdb")
+            logger.warning(
+                "LagAwareHealthCheck failed: Couldn't find a bdb matching any of "
+                f"the database hosts {sorted(db_hosts)}"
+            )
             raise ValueError("Could not find a matching bdb")
 
         url = (

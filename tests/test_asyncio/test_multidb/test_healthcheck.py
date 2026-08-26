@@ -589,6 +589,84 @@ class TestLagAwareHealthCheck:
         # Ensure both calls were attempted
         assert mock_http.get.call_count == 2
 
+    @pytest.mark.asyncio
+    async def test_cluster_database_matches_bdb_by_configured_endpoint(self, mock_cb):
+        """
+        Ensures a cluster database is matched by the endpoint it was configured with,
+        and not by the nodes it discovered. CLUSTER SLOTS advertises each node's own
+        address, which on a public Redis Enterprise endpoint is neither the endpoint
+        DNS name nor an address the bdb lists.
+        """
+        host = "redis-12000.cluster.example.com"
+        client = _mock_cluster_client(_mock_cluster_node())
+        client.startup_nodes = [AsyncClusterNode(host, 12000)]
+        client.get_nodes.return_value = [
+            Mock(spec=AsyncClusterNode, host="203.0.113.9")
+        ]
+
+        mock_http = AsyncMock()
+        mock_http.get.side_effect = [
+            [
+                {
+                    "uid": "bdb-cluster",
+                    "endpoints": [{"dns_name": host, "addr": ["10.0.0.1"]}],
+                }
+            ],
+            None,
+        ]
+
+        hc = LagAwareHealthCheck()
+        hc._http_client = mock_http
+
+        db = Database(client, mock_cb, 1.0, "https://healthcheck.example.com")
+
+        assert await hc.check_health(db, AsyncMock()) is True
+        assert (
+            mock_http.get.call_args_list[1].args[0]
+            == "/v1/bdbs/bdb-cluster/availability"
+            "?extend_check=lag&availability_lag_tolerance_ms=5000"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dns_name_match_is_preferred_over_addr_match(
+        self, mock_client, mock_cb
+    ):
+        """
+        Ensures the bdb owning the host as an endpoint DNS name wins over a bdb that
+        only lists the host among its endpoint addresses. Databases hosted by the same
+        cluster share the addresses their endpoints resolve to, so an address match is
+        ambiguous while a DNS name belongs to a single bdb.
+        """
+        host = "db4.example.com"
+        mock_client.get_connection_kwargs.return_value = {"host": host}
+
+        mock_http = AsyncMock()
+        mock_http.get.side_effect = [
+            [
+                {
+                    "uid": "bdb-by-addr",
+                    "endpoints": [{"dns_name": "other.example.com", "addr": [host]}],
+                },
+                {
+                    "uid": "bdb-by-dns-name",
+                    "endpoints": [{"dns_name": host, "addr": ["10.0.0.1"]}],
+                },
+            ],
+            None,
+        ]
+
+        hc = LagAwareHealthCheck()
+        hc._http_client = mock_http
+
+        db = Database(mock_client, mock_cb, 1.0, "https://healthcheck.example.com")
+
+        assert await hc.check_health(db, AsyncMock()) is True
+        assert (
+            mock_http.get.call_args_list[1].args[0]
+            == "/v1/bdbs/bdb-by-dns-name/availability"
+            "?extend_check=lag&availability_lag_tolerance_ms=5000"
+        )
+
 
 @pytest.mark.onlynoncluster
 @pytest.mark.no_mock_connections
