@@ -53,6 +53,8 @@ logging.basicConfig(
 
 logging.getLogger("redis.asyncio.maint_notifications").setLevel(logging.DEBUG)
 logging.getLogger("redis.asyncio.cluster").setLevel(logging.DEBUG)
+logging.getLogger("redis.asyncio.client").setLevel(logging.DEBUG)
+logging.getLogger("redis.asyncio.connection").setLevel(logging.DEBUG)
 
 STANDALONE_MAINT_TIMEOUT = 60
 
@@ -167,6 +169,7 @@ class TestAsyncPushNotificationsBase:
         configured_timeout: float = CLIENT_TIMEOUT,
     ):
         matching_conns_count = 0
+        mismatched: list[str] = []
         connections = await self._get_all_connections_in_pool(client)
         logging.info(f"Validating {len(connections)} connections")
 
@@ -179,13 +182,14 @@ class TestAsyncPushNotificationsBase:
                 ):
                     matching_conns_count += 1
                 else:
-                    logging.debug(
-                        f"Connection not matching default state: "
-                        f"maintenance_state={conn.maintenance_state}, "
-                        f"socket_timeout={conn.socket_timeout}, "
-                        f"host={conn.host}, "
-                        f"orig_host_address={getattr(conn, 'orig_host_address', None)}"
+                    detail = (
+                        f"{conn}: maintenance_state={conn.maintenance_state}, "
+                        f"socket_timeout={conn.socket_timeout}, host={conn.host}, "
+                        f"orig_host_address={getattr(conn, 'orig_host_address', None)}, "
+                        f"{conn.extract_connection_details()}"
                     )
+                    mismatched.append(detail)
+                    logging.debug(f"Connection not matching default state: {detail}")
             elif (
                 conn.socket_timeout == configured_timeout
                 and conn.maintenance_state == MaintenanceState.NONE
@@ -193,13 +197,14 @@ class TestAsyncPushNotificationsBase:
             ):
                 matching_conns_count += 1
             else:
-                logging.debug(
-                    f"Connection not matching default state: "
-                    f"maintenance_state={conn.maintenance_state}, "
-                    f"socket_timeout={conn.socket_timeout}, "
-                    f"host={conn.host}, "
-                    f"orig_host_address={getattr(conn, 'orig_host_address', None)}"
+                detail = (
+                    f"{conn}: maintenance_state={conn.maintenance_state}, "
+                    f"socket_timeout={conn.socket_timeout}, host={conn.host}, "
+                    f"orig_host_address={getattr(conn, 'orig_host_address', None)}, "
+                    f"{conn.extract_connection_details()}"
                 )
+                mismatched.append(detail)
+                logging.debug(f"Connection not matching default state: {detail}")
 
         conn_kwargs = client.connection_pool.connection_kwargs
         client_host = conn_kwargs.get("host", "unknown")
@@ -213,7 +218,8 @@ class TestAsyncPushNotificationsBase:
             f"Client: host={client_host}, port={client_port}, "
             f"configured_timeout={configured_timeout}. "
             f"Expected {expected_matching_conns_count} matching connections, "
-            f"but found {matching_conns_count} out of {len(connections)} total connections."
+            f"but found {matching_conns_count} out of {len(connections)} total connections. "
+            f"Non-matching connections: {'; '.join(mismatched) if mismatched else 'none'}"
         )
 
     async def _validate_default_notif_disabled_state(

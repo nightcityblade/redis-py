@@ -1926,11 +1926,15 @@ class RedisCluster(
                 raise
             except (ConnectionError, TimeoutError) as e:
                 if is_debug_log_enabled():
-                    socket_address = self._extracts_socket_address(connection)
+                    connection_details = (
+                        connection.extract_connection_details()
+                        if connection
+                        else "no connection"
+                    )
                     args_log_str = truncate_text(" ".join(map(safe_str, args)))
                     logger.debug(
                         f"{type(e).__name__} received for command {args_log_str}, on node {target_node.name}, "
-                        f"and connection: {connection} using local socket address: {socket_address}, error: {e}"
+                        f"and connection: {connection}, {connection_details}, error: {e}"
                     )
                 # this is used to report the metrics based on host and port info
                 e.connection = connection if connection else target_node
@@ -1969,11 +1973,15 @@ class RedisCluster(
                 raise e
             except MovedError as e:
                 if is_debug_log_enabled():
-                    socket_address = self._extracts_socket_address(connection)
+                    connection_details = (
+                        connection.extract_connection_details()
+                        if connection
+                        else "no connection"
+                    )
                     args_log_str = truncate_text(" ".join(map(safe_str, args)))
                     logger.debug(
                         f"MOVED error received for command {args_log_str}, on node {target_node.name}, "
-                        f"and connection: {connection} using local socket address: {socket_address}, error: {e}"
+                        f"and connection: {connection}, {connection_details}, error: {e}"
                     )
                 # First, we will try to patch the slots/nodes cache with the
                 # redirected node output and try again. If MovedError exceeds
@@ -2007,11 +2015,15 @@ class RedisCluster(
                 )
             except TryAgainError as e:
                 if is_debug_log_enabled():
-                    socket_address = self._extracts_socket_address(connection)
+                    connection_details = (
+                        connection.extract_connection_details()
+                        if connection
+                        else "no connection"
+                    )
                     args_log_str = truncate_text(" ".join(map(safe_str, args)))
                     logger.debug(
                         f"TRYAGAIN error received for command {args_log_str}, on node {target_node.name}, "
-                        f"and connection: {connection} using local socket address: {socket_address}"
+                        f"and connection: {connection}, {connection_details}"
                     )
                 if ttl < self.RedisClusterRequestTTL / 2:
                     time.sleep(0.05)
@@ -2028,11 +2040,15 @@ class RedisCluster(
                 )
             except AskError as e:
                 if is_debug_log_enabled():
-                    socket_address = self._extracts_socket_address(connection)
+                    connection_details = (
+                        connection.extract_connection_details()
+                        if connection
+                        else "no connection"
+                    )
                     args_log_str = truncate_text(" ".join(map(safe_str, args)))
                     logger.debug(
                         f"ASK error received for command {args_log_str}, on node {target_node.name}, "
-                        f"and connection: {connection} using local socket address: {socket_address}, error: {e}"
+                        f"and connection: {connection}, {connection_details}, error: {e}"
                     )
                 redirect_addr = get_node_name(host=e.host, port=e.port)
                 asking = True
@@ -2158,20 +2174,6 @@ class RedisCluster(
             retry_attempts=retry_attempts if retry_attempts is not None else 0,
             is_internal=is_internal,
         )
-
-    def _extracts_socket_address(
-        self, connection: Optional[Connection]
-    ) -> Optional[int]:
-        if connection is None:
-            return None
-        try:
-            socket_address = (
-                connection._sock.getsockname() if connection._sock else None
-            )
-            socket_address = socket_address[1] if socket_address else None
-        except (AttributeError, OSError):
-            pass
-        return socket_address
 
     def close(self) -> None:
         try:

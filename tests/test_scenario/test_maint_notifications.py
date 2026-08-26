@@ -51,6 +51,8 @@ logging.basicConfig(
 # Set DEBUG level for specific redis-py loggers
 logging.getLogger("redis.maint_notifications").setLevel(logging.DEBUG)
 logging.getLogger("redis.cluster").setLevel(logging.DEBUG)
+logging.getLogger("redis.client").setLevel(logging.DEBUG)
+logging.getLogger("redis.connection").setLevel(logging.DEBUG)
 
 
 STANDALONE_MAINT_TIMEOUT = 60
@@ -272,6 +274,7 @@ class TestPushNotificationsBase:
     ):
         """Validate the client connections are in the expected state after migration."""
         matching_conns_count = 0
+        mismatched: list[str] = []
         connections = self._get_all_connections_in_pool(client)
         logging.info(f"Validating {len(connections)} connections")
         logging.info(f"Expected matching conns count: {expected_matching_conns_count}")
@@ -285,13 +288,14 @@ class TestPushNotificationsBase:
                 ):
                     matching_conns_count += 1
                 else:
-                    logging.debug(
-                        f"Connection not matching default state: "
-                        f"maintenance_state={conn.maintenance_state}, "
-                        f"socket_timeout={conn.socket_timeout}, "
-                        f"host={conn.host}, "
-                        f"orig_host_address={conn.orig_host_address}"
+                    detail = (
+                        f"{conn}: maintenance_state={conn.maintenance_state}, "
+                        f"socket_timeout={conn.socket_timeout}, host={conn.host}, "
+                        f"orig_host_address={conn.orig_host_address}, "
+                        f"{conn.extract_connection_details()}"
                     )
+                    mismatched.append(detail)
+                    logging.debug(f"Connection not matching default state: {detail}")
             elif (
                 conn._sock.gettimeout() == configured_timeout
                 and conn.maintenance_state == MaintenanceState.NONE
@@ -299,13 +303,14 @@ class TestPushNotificationsBase:
             ):
                 matching_conns_count += 1
             else:
-                logging.debug(
-                    f"Connection not matching default state: "
-                    f"maintenance_state={conn.maintenance_state}, "
-                    f"socket_timeout={conn.socket_timeout}, "
-                    f"host={conn.host}, "
-                    f"orig_host_address={conn.orig_host_address}"
+                detail = (
+                    f"{conn}: maintenance_state={conn.maintenance_state}, "
+                    f"socket_timeout={conn.socket_timeout}, host={conn.host}, "
+                    f"orig_host_address={conn.orig_host_address}, "
+                    f"{conn.extract_connection_details()}"
                 )
+                mismatched.append(detail)
+                logging.debug(f"Connection not matching default state: {detail}")
 
         # Get client configuration details for error message
         conn_kwargs = client.connection_pool.connection_kwargs
@@ -320,7 +325,8 @@ class TestPushNotificationsBase:
             f"Client: host={client_host}, port={client_port}, "
             f"configured_timeout={configured_timeout}. "
             f"Expected {expected_matching_conns_count} matching connections, "
-            f"but found {matching_conns_count} out of {len(connections)} total connections."
+            f"but found {matching_conns_count} out of {len(connections)} total connections. "
+            f"Non-matching connections: {'; '.join(mismatched) if mismatched else 'none'}"
         )
 
     def _validate_default_notif_disabled_state(
