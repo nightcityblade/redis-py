@@ -73,16 +73,9 @@ async def trigger_network_failure_action(
     )
 
     result = await fault_injector_client.trigger_action(action_request)
-    status_result = await fault_injector_client.get_action_status(result["action_id"])
-
-    while status_result["status"] != "success":
-        await asyncio.sleep(0.1)
-        status_result = await fault_injector_client.get_action_status(
-            result["action_id"]
-        )
-        logger.info(
-            f"Waiting for action to complete. Status: {status_result['status']}"
-        )
+    status_result = await fault_injector_client.get_operation_result(
+        result["action_id"]
+    )
 
     if event:
         event.set()

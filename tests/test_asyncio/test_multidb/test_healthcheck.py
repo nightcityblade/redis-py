@@ -377,11 +377,11 @@ class TestPingHealthCheck:
 
         assert not await hc.check_health(db, mock_hc_client)
 
-        # Should stop after the failing node
+        # Every node is pinged: the pings are issued concurrently, so the failing
+        # one cannot spare the nodes behind it.
         mock_node1.execute_command.assert_awaited_once_with("PING")
         mock_node2.execute_command.assert_awaited_once_with("PING")
-        # Node 3 should not be checked (early exit on failure)
-        mock_node3.execute_command.assert_not_awaited()
+        mock_node3.execute_command.assert_awaited_once_with("PING")
 
     @pytest.mark.asyncio
     async def test_cluster_health_check_client_is_initialized_before_ping(
@@ -425,6 +425,70 @@ class TestPingHealthCheck:
 
         assert not await hc.check_health(db, mock_hc_client)
         mock_hc_client.initialize.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cluster_nodes_are_pinged_concurrently(self, mock_client, mock_cb):
+        """
+        Verify that the nodes of a cluster are pinged concurrently.
+
+        A single health_check_timeout covers the whole health check, so pinging
+        the nodes one after another would make the budget scale with the size of
+        the cluster.
+        """
+        in_flight = 0
+        max_in_flight = 0
+
+        async def tracking_ping(*args, **kwargs):
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            # Long enough for the overlap to be observable, short enough to keep
+            # the test fast.
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+            return True
+
+        nodes = [_mock_cluster_node() for _ in range(3)]
+
+        for node in nodes:
+            node.execute_command.side_effect = tracking_ping
+
+        mock_hc_client = _mock_cluster_client(*nodes)
+
+        hc = PingHealthCheck()
+        db = Database(mock_client, mock_cb, 0.9)
+
+        assert await hc.check_health(db, mock_hc_client)
+        assert max_in_flight == len(nodes), (
+            f"Expected {len(nodes)} concurrent pings, got max {max_in_flight}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cluster_ping_error_is_propagated(self, mock_client, mock_cb):
+        """
+        Verify that a failing PING propagates instead of being reported as an
+        unhealthy result, so the policy can wrap it in an
+        UnhealthyDatabaseException and the reason stays in the logs.
+
+        The remaining nodes are still awaited: their pings are already in flight
+        when the failure surfaces, and dropping them would leave tasks running
+        unawaited.
+        """
+        mock_node1 = _mock_cluster_node(ping_result=True)
+        mock_node2 = _mock_cluster_node()
+        mock_node2.execute_command.side_effect = ConnectionError("Node is down")
+        mock_node3 = _mock_cluster_node(ping_result=True)
+        mock_hc_client = _mock_cluster_client(mock_node1, mock_node2, mock_node3)
+
+        hc = PingHealthCheck()
+        db = Database(mock_client, mock_cb, 0.9)
+
+        with pytest.raises(ConnectionError, match="Node is down"):
+            await hc.check_health(db, mock_hc_client)
+
+        mock_node1.execute_command.assert_awaited_once_with("PING")
+        mock_node2.execute_command.assert_awaited_once_with("PING")
+        mock_node3.execute_command.assert_awaited_once_with("PING")
 
 
 @pytest.mark.onlynoncluster

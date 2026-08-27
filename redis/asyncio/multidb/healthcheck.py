@@ -396,8 +396,24 @@ class PingHealthCheck(AbstractHealthCheck):
             if not all_nodes:
                 return False
 
-            for node in all_nodes:
-                if not await node.execute_command("PING"):
+            # The nodes are pinged concurrently rather than one after another: a
+            # single health_check_timeout covers the whole health check - every
+            # probe of it - so a serial loop makes the budget scale with the size
+            # of the cluster. Gathering keeps a probe at the cost of one round
+            # trip. Exceptions are collected rather than propagated by gather
+            # itself, so that a failing node does not leave its siblings running
+            # unawaited; the first one is re-raised below to keep the caller's
+            # error handling unchanged.
+            results = await asyncio.gather(
+                *(node.execute_command("PING") for node in all_nodes),
+                return_exceptions=True,
+            )
+
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+
+                if not result:
                     return False
 
             return True
