@@ -216,12 +216,19 @@ class SocketBuffer:
         if unread > 0:
             return
 
+        # Bind the buffer once: another thread's ``close()`` can drop
+        # ``self._buffer`` to None between the read above and the truncate below,
+        # and the resulting AttributeError would escape ``purge()``'s best effort
+        # wrapper. A local reference to an already closed buffer raises
+        # ValueError, which ``purge()`` handles.
+        buffer = self._live_buffer()
+
         if unread > 0:
             # move unread data to the front
-            view = self._buffer.getbuffer()
+            view = buffer.getbuffer()
             view[:unread] = view[-unread:]
-        self._buffer.truncate(unread)
-        self._buffer.seek(0)
+        buffer.truncate(unread)
+        buffer.seek(0)
 
     def close(self) -> None:
         try:

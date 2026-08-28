@@ -556,6 +556,28 @@ def test_socket_buffer_cleanup_after_close_does_not_raise():
     socket_buffer.rewind(0)
 
 
+def test_socket_buffer_purge_survives_a_close_landing_mid_purge():
+    """
+    ``purge`` stays best effort when the close lands inside it.
+
+    This is the window the test above cannot cover: the buffer is open when purge
+    reads the unread length and gone by the time it truncates. ``close()`` drops the
+    buffer to None, so an unguarded truncate raised AttributeError - which escapes
+    purge's best effort wrapper and replaces an already parsed response.
+    """
+    socket_buffer = SocketBuffer(Mock(), socket_read_size=65536, socket_timeout=None)
+    unread_bytes = socket_buffer.unread_bytes
+
+    def close_then_report():
+        unread = unread_bytes()
+        socket_buffer.close()
+        return unread
+
+    socket_buffer.unread_bytes = close_then_report
+
+    socket_buffer.purge()
+
+
 @skip_if_server_version_lt("4.0.0")
 @pytest.mark.redismod
 def test_loading_external_modules(r):

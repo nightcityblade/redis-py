@@ -127,6 +127,30 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def add_debug_log_for_connection_failure(
+    connection: "AbstractConnection",
+    error: BaseException,
+    operation: str,
+) -> None:
+    """
+    Render the connection's live state on a failure that is about to close it.
+
+    Must be called *before* ``disconnect()``. ``extract_connection_details()``
+    reads the resolved ip, local port and armed read timeout off the socket, so
+    once the socket is gone it can only report ``not connected`` - which hides
+    exactly the state needed to explain the failure. In particular it is what
+    tells apart a read that ran under the original timeout from one that ran
+    under a relaxed maintenance timeout.
+    """
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            f"{type(error).__name__} while {operation}, "
+            f"with connection: {connection}, "
+            f"details: {connection.extract_connection_details()}, "
+            f"error: {error}",
+        )
+
+
 class HiredisRespSerializer:
     def pack(self, *args: List):
         """Pack a series of arguments into the Redis protocol"""
@@ -688,8 +712,10 @@ class MaintNotificationsAbstractConnection:
             conn_socket = self._get_socket()
             if conn_socket is not None:
                 peer_addr = conn_socket.getpeername()
-                if peer_addr and len(peer_addr) >= 1:
-                    # For TCP sockets, peer_addr is typically (host, port) tuple
+                # For TCP sockets, peer_addr is typically a (host, port) tuple.
+                # AF_UNIX sockets report a path string instead, and indexing it
+                # would yield the first character of the path.
+                if isinstance(peer_addr, tuple) and peer_addr:
                     # Return just the host part
                     return peer_addr[0]
         except (AttributeError, OSError):
@@ -762,12 +788,19 @@ class MaintNotificationsAbstractConnection:
             # will lead to a deadlock
             if conn_socket.gettimeout() != 0:
                 conn_socket.settimeout(timeout)
-            self.update_parser_timeout(timeout)
+                # Only update the parser once the socket actually took the new
+                # value. The parser caches it to restore after a per-call
+                # timeout override, so updating one without the other leaves
+                # the restored timeout disagreeing with the armed one.
+                self.update_parser_timeout(timeout)
 
     def update_parser_timeout(self, timeout: Optional[float] = None):
         parser = self._get_parser()
         if parser and parser._buffer:
-            if isinstance(parser, _RESP3Parser) and timeout:
+            # Both parsers cache this value to restore after a per-call timeout
+            # override, so both must receive exactly what was armed on the
+            # socket - including None, which means "block indefinitely".
+            if isinstance(parser, _RESP3Parser):
                 parser._buffer.socket_timeout = timeout
             elif isinstance(parser, _HiredisParser):
                 parser._socket_timeout = timeout
@@ -1349,10 +1382,12 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 command = [command]
             for item in command:
                 self._sock.sendall(item)
-        except socket.timeout:
+        except socket.timeout as e:
+            add_debug_log_for_connection_failure(self, e, "writing command")
             self.disconnect()
             raise TimeoutError("Timeout writing to socket")
         except OSError as e:
+            add_debug_log_for_connection_failure(self, e, "writing command")
             self.disconnect()
             if len(e.args) == 1:
                 errno, errmsg = "UNKNOWN", e.args[0]
@@ -1360,11 +1395,12 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 errno = e.args[0]
                 errmsg = e.args[1]
             raise ConnectionError(f"Error {errno} while writing to socket. {errmsg}.")
-        except BaseException:
+        except BaseException as e:
             # BaseExceptions can be raised when a socket send operation is not
             # finished, e.g. due to a timeout.  Ideally, a caller could then re-try
             # to send un-sent data. However, the send_packed_command() API
             # does not support it so there is no point in keeping the connection open.
+            add_debug_log_for_connection_failure(self, e, "writing command")
             self.disconnect()
             raise
 
@@ -1415,19 +1451,31 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 response = self._parser.read_response(
                     disable_decoding=disable_decoding, timeout=timeout
                 )
-        except socket.timeout:
+        except socket.timeout as e:
             if disconnect_on_error:
+                add_debug_log_for_connection_failure(self, e, "reading response")
+                self.disconnect()
+            raise TimeoutError(f"Timeout reading from {host_error}")
+        except TimeoutError as e:
+            # The parsers raise redis.exceptions.TimeoutError, which is not an
+            # OSError, so without this branch it would fall through to
+            # BaseException and keep the parser's undecorated message. Re-raise
+            # it with the host, matching what the async stack already reports.
+            if disconnect_on_error:
+                add_debug_log_for_connection_failure(self, e, "reading response")
                 self.disconnect()
             raise TimeoutError(f"Timeout reading from {host_error}")
         except OSError as e:
             if disconnect_on_error:
+                add_debug_log_for_connection_failure(self, e, "reading response")
                 self.disconnect()
             raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
-        except BaseException:
+        except BaseException as e:
             # Also by default close in case of BaseException.  A lot of code
             # relies on this behaviour when doing Command/Response pairs.
             # See #1128.
             if disconnect_on_error:
+                add_debug_log_for_connection_failure(self, e, "reading response")
                 self.disconnect()
             raise
 
@@ -1552,7 +1600,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         return (
             f"connected to ip {self.get_resolved_ip()}, "
             f"local socket port: {socket_address}, "
-            f"host: {self.host}:{self.port} "
+            f"host: {self._host_error()} "
             f"(orig: {getattr(self, 'orig_host_address', None)}), "
             f"state: {state}, "
             f"socket_timeout: {self.socket_timeout} "

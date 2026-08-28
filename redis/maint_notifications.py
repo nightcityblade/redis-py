@@ -641,7 +641,8 @@ class MaintNotificationsConfig:
             proactive_reconnect (bool): Whether to proactively reconnect when a node is replaced.
                 Defaults to True.
             relaxed_timeout (Number): The relaxed timeout to use for the connection during maintenance.
-                If -1 is provided - the relaxed timeout is disabled. Defaults to 20.
+                If -1 is provided - the relaxed timeout is disabled. If None is provided - the
+                affected operations become blocking. Defaults to 10.
             endpoint_type (Optional[EndpointType]): Override for the endpoint type to use in CLIENT MAINT_NOTIFICATIONS.
                 If None, the endpoint type will be automatically determined based on the host and TLS configuration.
                 Defaults to None.
