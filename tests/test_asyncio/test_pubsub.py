@@ -2395,6 +2395,8 @@ class TestClusterPubSubSlotMigration:
         pubsub.node_pubsub_mapping = {}
         pubsub._shard_channel_to_node = {}
         pubsub._poll_cool_off = weakref.WeakKeyDictionary()
+        pubsub._unreachable_nodes = set()
+        pubsub._next_topology_repair = 0.0
         pubsub._shard_state_lock = asyncio.Lock()
         pubsub._reconcile_tasks = set()
         pubsub.push_handler_func = None
@@ -2449,6 +2451,32 @@ class TestClusterPubSubSlotMigration:
 
         owner_ps.sunsubscribe.assert_not_awaited()
         owner_ps.ssubscribe.assert_not_awaited()
+        assert pubsub._shard_channel_to_node[channel] == owner.name
+
+    async def test_reinitialize_reattaches_when_owner_lost_the_subscription(self):
+        """
+        A pass that detached from the old owner and then failed to attach leaves
+        the channel subscribed nowhere while the reverse index still names a
+        node. If ownership then moves back to that node, the unchanged-owner
+        short-circuit would skip the channel for the lifetime of the pubsub, so
+        the missing subscription has to be re-attached instead.
+        """
+        pubsub = self._make_cluster_pubsub()
+        owner = self._make_node("127.0.0.1:7000")
+        channel = b"foo"
+        # Index says owner holds the channel; its pubsub does not.
+        owner_ps = self._make_node_pubsub()
+        pubsub.node_pubsub_mapping[owner.name] = owner_ps
+        pubsub.shard_channels = {channel: None}
+        pubsub._shard_channel_to_node = {channel: owner.name}
+        pubsub.cluster.get_node_from_key.return_value = owner
+
+        with patch.object(pubsub, "_get_node_pubsub", return_value=owner_ps):
+            await pubsub.reinitialize_shard_subscriptions()
+
+        # Nothing to sunsubscribe from - the channel was already detached.
+        owner_ps.sunsubscribe.assert_not_awaited()
+        owner_ps.ssubscribe.assert_awaited_once_with(channel)
         assert pubsub._shard_channel_to_node[channel] == owner.name
 
     async def test_reinitialize_tolerates_old_node_disconnect(self):
@@ -3034,6 +3062,135 @@ class TestClusterPubSubSlotMigration:
         await pubsub._sharded_message_generator(timeout=0.01)
 
         assert ps not in pubsub._poll_cool_off
+
+    async def test_failed_poll_schedules_one_throttled_topology_refresh(self):
+        """
+        A node that has left the deployment answers ECONNREFUSED, never MOVED, so
+        the failed poll is the only signal that its shard channels need a new
+        owner. Reconciliation is otherwise purely event-driven, so the read path
+        has to ask for a slots-cache refresh - throttled, because a node that is
+        down fails every poll.
+        """
+        from redis.asyncio.cluster import SHARD_TOPOLOGY_REPAIR_INTERVAL_SECONDS
+
+        pubsub = self._make_cluster_pubsub()
+        pubsub.shard_channels = {b"foo": None}
+        bad = self._make_node_pubsub({b"foo": None})
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": bad}
+        self._prime_generator(pubsub)
+        pubsub.cluster.nodes_manager.initialize = AsyncMock()
+
+        with pytest.raises(ConnectionError):
+            await pubsub._sharded_message_generator(timeout=0.01)
+        await asyncio.gather(*pubsub._reconcile_tasks, return_exceptions=True)
+        assert pubsub.cluster.nodes_manager.initialize.await_count == 1
+        assert pubsub._unreachable_nodes == {"127.0.0.1:7000"}
+
+        # Second failure inside the throttle window must not refresh again.
+        pubsub._poll_cool_off.pop(bad, None)
+        with pytest.raises(ConnectionError):
+            await pubsub._sharded_message_generator(timeout=0.01)
+        await asyncio.gather(*pubsub._reconcile_tasks, return_exceptions=True)
+        assert pubsub.cluster.nodes_manager.initialize.await_count == 1
+
+        # Once the window expires the next failure asks again.
+        pubsub._next_topology_repair = (
+            time.monotonic() - SHARD_TOPOLOGY_REPAIR_INTERVAL_SECONDS
+        )
+        pubsub._poll_cool_off.pop(bad, None)
+        with pytest.raises(ConnectionError):
+            await pubsub._sharded_message_generator(timeout=0.01)
+        await asyncio.gather(*pubsub._reconcile_tasks, return_exceptions=True)
+        assert pubsub.cluster.nodes_manager.initialize.await_count == 2
+
+    async def test_failed_poll_does_not_refresh_without_shard_channels(self):
+        """Nothing to reconcile means nothing to refresh the topology for."""
+        pubsub = self._make_cluster_pubsub()
+        bad = self._make_node_pubsub()
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": bad}
+        self._prime_generator(pubsub)
+        pubsub.cluster.nodes_manager.initialize = AsyncMock()
+
+        with pytest.raises(ConnectionError):
+            await pubsub._sharded_message_generator(timeout=0.01)
+
+        pubsub.cluster.nodes_manager.initialize.assert_not_awaited()
+
+    async def test_successful_poll_clears_the_unreachable_mark(self):
+        """A node that answers again must not keep the migration fast path."""
+        pubsub = self._make_cluster_pubsub()
+        ps = self._make_node_pubsub({b"foo": None})
+        ps.get_message.return_value = None
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": ps}
+        self._prime_generator(pubsub)
+        pubsub._unreachable_nodes = {"127.0.0.1:7000"}
+
+        await pubsub._sharded_message_generator(timeout=0.01)
+
+        assert pubsub._unreachable_nodes == set()
+
+    async def test_migration_skips_sunsubscribe_on_an_unreachable_old_node(self):
+        """
+        A SUNSUBSCRIBE to a node the reader just failed to reach cannot arrive,
+        and attempting it costs a full reconnect plus the client's retry budget -
+        queued behind the reader on the same per-node io lock, while this pass
+        holds ``_shard_state_lock``. Detach locally instead and re-SSUBSCRIBE on
+        the new owner straight away.
+        """
+        pubsub = self._make_cluster_pubsub()
+        old_pubsub = self._make_node_pubsub({b"foo": None})
+        new_pubsub = self._make_node_pubsub()
+        new_pubsub.shard_channels = {b"foo": None}
+        new_node = self._make_node("127.0.0.1:7001")
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": old_pubsub,
+            "127.0.0.1:7001": new_pubsub,
+        }
+        pubsub.shard_channels = {b"foo": None}
+        pubsub._shard_channel_to_node = {b"foo": "127.0.0.1:7000"}
+        pubsub._unreachable_nodes = {"127.0.0.1:7000"}
+        pubsub.cluster.get_node.return_value = self._make_node("127.0.0.1:7000")
+
+        with patch.object(
+            pubsub, "_get_node_pubsub", return_value=new_pubsub
+        ) as get_node_pubsub:
+            await pubsub._migrate_shard_channel(
+                b"foo", None, "127.0.0.1:7000", new_node
+            )
+
+        old_pubsub.sunsubscribe.assert_not_awaited()
+        assert b"foo" not in old_pubsub.shard_channels
+        get_node_pubsub.assert_called_once_with(new_node)
+        new_pubsub.ssubscribe.assert_awaited_once_with(b"foo")
+        assert pubsub._shard_channel_to_node[b"foo"] == "127.0.0.1:7001"
+
+    async def test_migration_drops_an_unreachable_node_gone_from_the_topology(self):
+        """
+        A departed node has no reconnect target, so its per-node pubsub is
+        dropped rather than left for the round robin to keep yielding - and the
+        unreachable mark goes with it.
+        """
+        pubsub = self._make_cluster_pubsub()
+        old_pubsub = self._make_node_pubsub({b"foo": None})
+        new_pubsub = self._make_node_pubsub()
+        new_node = self._make_node("127.0.0.1:7001")
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": old_pubsub}
+        pubsub.shard_channels = {b"foo": None}
+        pubsub._shard_channel_to_node = {b"foo": "127.0.0.1:7000"}
+        pubsub._unreachable_nodes = {"127.0.0.1:7000"}
+        pubsub.cluster.get_node.return_value = None
+
+        with patch.object(pubsub, "_get_node_pubsub", return_value=new_pubsub):
+            await pubsub._migrate_shard_channel(
+                b"foo", None, "127.0.0.1:7000", new_node
+            )
+
+        old_pubsub.sunsubscribe.assert_not_awaited()
+        old_pubsub.aclose.assert_awaited_once()
+        assert "127.0.0.1:7000" not in pubsub.node_pubsub_mapping
+        assert pubsub._unreachable_nodes == set()
 
 
 class _StatefulNodePubSub:

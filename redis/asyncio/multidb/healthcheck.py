@@ -540,12 +540,19 @@ class LagAwareHealthCheck(AbstractHealthCheck):
 
         db_hosts = self._database_hosts(database)
 
+        # Absolute URLs, rather than a base_url set on the HTTP client: one
+        # LagAwareHealthCheck instance serves every database and MultiDBClient
+        # checks them concurrently, so a base_url assignment made here would be
+        # overwritten by another database's check while this one is awaiting its
+        # response - sending the second request to the wrong cluster.
         base_url = f"{database.health_check_url}:{self._rest_api_port}"
-        self._http_client.client.base_url = base_url
 
         # Find bdb matching to the current database host
         matching_bdb = self._find_matching_bdb(
-            await self._http_client.get("/v1/bdbs"), db_hosts
+            await self._http_client.get(
+                f"{base_url}/v1/bdbs", timeout=self.health_check_timeout
+            ),
+            db_hosts,
         )
 
         if matching_bdb is None:
@@ -556,10 +563,12 @@ class LagAwareHealthCheck(AbstractHealthCheck):
             raise ValueError("Could not find a matching bdb")
 
         url = (
-            f"/v1/bdbs/{matching_bdb['uid']}/availability"
+            f"{base_url}/v1/bdbs/{matching_bdb['uid']}/availability"
             f"?extend_check=lag&availability_lag_tolerance_ms={self._lag_aware_tolerance}"
         )
-        await self._http_client.get(url, expect_json=False)
+        await self._http_client.get(
+            url, expect_json=False, timeout=self.health_check_timeout
+        )
 
         # Status checked in an http client, otherwise HttpError will be raised
         return True

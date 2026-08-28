@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from redis.asyncio import Redis
 from redis.asyncio.cluster import ClusterNode as AsyncClusterNode
 from redis.asyncio.cluster import RedisCluster as AsyncRedisCluster
 from redis.asyncio.multidb.database import Database
@@ -530,16 +531,17 @@ class TestLagAwareHealthCheck:
         )  # Not used by LagAwareHealthCheck but required by signature
 
         assert await hc.check_health(db, mock_hc_client) is True
-        # Base URL must be set correctly
-        assert hc._http_client.client.base_url == "https://healthcheck.example.com:1234"
-        # Calls: first to list bdbs, then to availability
+        # Calls: first to list bdbs, then to availability. Both carry the database's
+        # own base URL, so a concurrent check on another database cannot redirect
+        # them at the wrong cluster.
         assert mock_http.get.call_count == 2
         first_call = mock_http.get.call_args_list[0]
         second_call = mock_http.get.call_args_list[1]
-        assert first_call.args[0] == "/v1/bdbs"
+        assert first_call.args[0] == "https://healthcheck.example.com:1234/v1/bdbs"
         assert (
             second_call.args[0]
-            == "/v1/bdbs/bdb-1/availability?extend_check=lag&availability_lag_tolerance_ms=150"
+            == "https://healthcheck.example.com:1234/v1/bdbs/bdb-1/availability"
+            "?extend_check=lag&availability_lag_tolerance_ms=150"
         )
         assert second_call.kwargs.get("expect_json") is False
 
@@ -578,7 +580,8 @@ class TestLagAwareHealthCheck:
         assert mock_http.get.call_count == 2
         assert (
             mock_http.get.call_args_list[1].args[0]
-            == "/v1/bdbs/bdb-42/availability?extend_check=lag&availability_lag_tolerance_ms=5000"
+            == "https://healthcheck.example.com:9443/v1/bdbs/bdb-42/availability"
+            "?extend_check=lag&availability_lag_tolerance_ms=5000"
         )
 
     @pytest.mark.asyncio
@@ -616,7 +619,10 @@ class TestLagAwareHealthCheck:
             await hc.check_health(db, mock_hc_client)
 
         # Only the listing call should have happened
-        mock_http.get.assert_called_once_with("/v1/bdbs")
+        mock_http.get.assert_called_once_with(
+            "https://healthcheck.example.com:9443/v1/bdbs",
+            timeout=hc.health_check_timeout,
+        )
 
     @pytest.mark.asyncio
     async def test_propagates_http_error_from_availability(self, mock_client, mock_cb):
@@ -687,7 +693,7 @@ class TestLagAwareHealthCheck:
         assert await hc.check_health(db, AsyncMock()) is True
         assert (
             mock_http.get.call_args_list[1].args[0]
-            == "/v1/bdbs/bdb-cluster/availability"
+            == "https://healthcheck.example.com:9443/v1/bdbs/bdb-cluster/availability"
             "?extend_check=lag&availability_lag_tolerance_ms=5000"
         )
 
@@ -727,9 +733,63 @@ class TestLagAwareHealthCheck:
         assert await hc.check_health(db, AsyncMock()) is True
         assert (
             mock_http.get.call_args_list[1].args[0]
-            == "/v1/bdbs/bdb-by-dns-name/availability"
+            == "https://healthcheck.example.com:9443/v1/bdbs/bdb-by-dns-name/availability"
             "?extend_check=lag&availability_lag_tolerance_ms=5000"
         )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_checks_do_not_share_one_base_url(self, mock_cb):
+        """
+        Ensures two databases checked concurrently by the same health check instance each
+        talk to their own cluster's REST API. MultiDBClient checks every database at once
+        through a single shared LagAwareHealthCheck, so the target must travel with the
+        request instead of being stashed on the shared HTTP client - otherwise one
+        database's check overwrites the other's while it awaits a response, and the bdb
+        listing comes back from the wrong cluster.
+        """
+        clusters = {
+            "https://cluster-a.example.com": ("db-a.example.com", "bdb-a"),
+            "https://cluster-b.example.com": ("db-b.example.com", "bdb-b"),
+        }
+        requested = []
+
+        async def fake_get(path, *args, expect_json=True, timeout=None):
+            requested.append(path)
+            # Hand control back mid-check so the two checks interleave, the way the
+            # thread-pool-backed HTTP client does on every request.
+            await asyncio.sleep(0)
+            base_url = path.rsplit("/v1/bdbs", 1)[0]
+            dns_name, uid = clusters[base_url.rsplit(":", 1)[0]]
+            if path.endswith("/v1/bdbs"):
+                # A cluster's REST API only lists the bdbs that cluster hosts.
+                return [{"uid": uid, "endpoints": [{"dns_name": dns_name, "addr": []}]}]
+            return None
+
+        mock_http = AsyncMock()
+        mock_http.get = fake_get
+
+        hc = LagAwareHealthCheck()
+        hc._http_client = mock_http
+
+        databases = []
+        for base_url, (dns_name, _) in clusters.items():
+            client = Mock(spec=Redis)
+            client.get_connection_kwargs.return_value = {"host": dns_name}
+            databases.append(Database(client, mock_cb, 1.0, base_url))
+
+        results = await asyncio.gather(
+            *(hc.check_health(db, AsyncMock()) for db in databases)
+        )
+
+        assert results == [True, True]
+        assert sorted(requested) == [
+            "https://cluster-a.example.com:9443/v1/bdbs",
+            "https://cluster-a.example.com:9443/v1/bdbs/bdb-a/availability"
+            "?extend_check=lag&availability_lag_tolerance_ms=5000",
+            "https://cluster-b.example.com:9443/v1/bdbs",
+            "https://cluster-b.example.com:9443/v1/bdbs/bdb-b/availability"
+            "?extend_check=lag&availability_lag_tolerance_ms=5000",
+        ]
 
 
 @pytest.mark.onlynoncluster
