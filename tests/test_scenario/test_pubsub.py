@@ -48,6 +48,10 @@ POST_RECOVERY_WINDOW_MESSAGES = 20
 # a short burst, so sampling from the first error hides the very errors that explain it.
 SUBSCRIBER_ERROR_LOG_BURST = 5
 SUBSCRIBER_ERROR_LOG_INTERVAL = 10
+# Pause after a failed read before polling again. Without it a node that fails to
+# connect is retried as fast as the network stack allows, which buries the log in
+# identical errors and starves the healthy nodes of the one reader's attention.
+SUBSCRIBER_ERROR_BACKOFF = 0.05
 BASELINE_TIMEOUT = 30
 RECOVERY_TIMEOUT = 120
 SHARD_FAILURE_RECOVERY_TIMEOUT = 180
@@ -426,6 +430,34 @@ async def async_cluster_client(
         await client.aclose()
 
 
+def delivery_breakdown(received_by_subscriber, channels, subscribers_pubsubs):
+    """Per-channel delivery counts and per-node pubsub fan-out.
+
+    ``received`` on its own cannot say whether delivery stopped on the channels
+    a fault actually touched or on all of them, and the two point at very
+    different causes: the first is a routing or re-subscription failure on the
+    migrated slots, the second is the one reader being starved by an unhealthy
+    per-node pubsub. ``node_pubsubs`` is here for the same reason - an empty
+    mapping means there is nothing left to poll at all.
+    """
+    parts = []
+    # Driven by the pubsubs actually created, not by received_by_subscriber: the
+    # latter is sized up front while the former grows during setup, and this runs
+    # from a finally block that must not raise over a half-built subscriber list.
+    for index, pubsub in enumerate(subscribers_pubsubs):
+        received = received_by_subscriber[index]
+        counts = " ".join(f"{channel}={len(received[channel])}" for channel in channels)
+        try:
+            node_pubsubs = sorted(getattr(pubsub, "node_pubsub_mapping", {}))
+        except RuntimeError:
+            # Reconciliation mutates node_pubsub_mapping from its own thread and
+            # this is diagnostics: never let it raise over the failure it is
+            # meant to explain.
+            node_pubsubs = "<mutating>"
+        parts.append(f"subscriber{index}: {counts} node_pubsubs={node_pubsubs}")
+    return "; ".join(parts)
+
+
 def run_sharded_pubsub_scenario(
     client,
     endpoint_config,
@@ -464,11 +496,15 @@ def run_sharded_pubsub_scenario(
             subscriber_threads_alive = sum(
                 thread.is_alive() for _, thread in subscribers
             )
+            breakdown = delivery_breakdown(
+                received_by_subscriber, channels, [ps for ps, _ in subscribers]
+            )
             return (
                 f"sent={sent_messages}, received={received_messages}, "
                 f"publish_errors={publish_errors}, "
                 f"subscriber_errors={subscriber_errors}, "
                 f"subscriber_threads_alive={subscriber_threads_alive}/{len(subscribers)}"
+                f"; {breakdown}"
             )
 
     def handle_subscriber_error(error, pubsub, thread):
@@ -488,11 +524,21 @@ def run_sharded_pubsub_scenario(
             or errors % SUBSCRIBER_ERROR_LOG_INTERVAL == 0
             or new_error_type
         ):
+            # Both the repr and the str: RedisError.__repr__ renders only
+            # "network:TimeoutError", which drops the host and the reason - and
+            # those are what tell a poll timeout apart from a reconnect
+            # handshake timing out on one specific node.
             logging.info(
-                "Pub/Sub subscriber read error: errors=%s error=%r",
+                "Pub/Sub subscriber read error: errors=%s error=%r (%s)",
                 errors,
                 error,
+                error,
             )
+
+        # PubSubWorkerThread re-enters get_sharded_message the moment the handler
+        # returns, so without this a node that fails to connect is retried as fast
+        # as the network stack allows. Matches the async reader's own backoff.
+        time.sleep(SUBSCRIBER_ERROR_BACKOFF)
 
     def publish_messages():
         nonlocal publish_errors, sent_messages
@@ -729,11 +775,13 @@ async def async_run_sharded_pubsub_recovery_scenario(
 
     def progress_message():
         subscriber_tasks_alive = sum(not task.done() for task in reader_tasks)
+        breakdown = delivery_breakdown(received_by_subscriber, channels, subscribers)
         return (
             f"sent={sent_messages}, received={received_messages}, "
             f"publish_errors={publish_errors}, "
             f"subscriber_errors={subscriber_errors}, "
             f"subscriber_tasks_alive={subscriber_tasks_alive}/{len(reader_tasks)}"
+            f"; {breakdown}"
         )
 
     def handle_subscriber_error(error):
@@ -753,9 +801,14 @@ async def async_run_sharded_pubsub_recovery_scenario(
             or subscriber_errors % SUBSCRIBER_ERROR_LOG_INTERVAL == 0
             or new_error_type
         ):
+            # Both the repr and the str: RedisError.__repr__ renders only
+            # "network:TimeoutError", which drops the host and the reason - and
+            # those are what tell a poll timeout apart from a reconnect
+            # handshake timing out on one specific node.
             logging.info(
-                "Async Pub/Sub subscriber read error: errors=%s error=%r",
+                "Async Pub/Sub subscriber read error: errors=%s error=%r (%s)",
                 subscriber_errors,
+                error,
                 error,
             )
 
@@ -802,7 +855,7 @@ async def async_run_sharded_pubsub_recovery_scenario(
                 if stop_event.is_set():
                     return
                 handle_subscriber_error(error)
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(SUBSCRIBER_ERROR_BACKOFF)
 
     try:
         for index in range(subscriber_count):

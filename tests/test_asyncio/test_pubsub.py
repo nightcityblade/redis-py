@@ -3,6 +3,8 @@ import functools
 import logging
 import socket
 import sys
+import time
+import weakref
 from collections import defaultdict
 from typing import Optional
 from unittest.mock import patch, AsyncMock, MagicMock
@@ -2392,6 +2394,7 @@ class TestClusterPubSubSlotMigration:
         pubsub.cluster = MagicMock()
         pubsub.node_pubsub_mapping = {}
         pubsub._shard_channel_to_node = {}
+        pubsub._poll_cool_off = weakref.WeakKeyDictionary()
         pubsub._shard_state_lock = asyncio.Lock()
         pubsub._reconcile_tasks = set()
         pubsub.push_handler_func = None
@@ -2455,7 +2458,9 @@ class TestClusterPubSubSlotMigration:
         abort migration, and the old per-node pubsub must be left in
         place so ``PubSub._execute`` can auto-reconnect and
         ``on_connect`` can re-subscribe the remaining channels on the
-        next read.
+        next read. The migrated channel is not one of them: it is
+        detached locally so the replay cannot put it back on the node it
+        was migrated away from.
         """
         pubsub = self._make_cluster_pubsub()
         old_node = self._make_node("127.0.0.1:7000")
@@ -2482,6 +2487,8 @@ class TestClusterPubSubSlotMigration:
         # Connection.disconnect() before the exception surfaced.
         old_ps.aclose.assert_not_awaited()
         assert old_node.name in pubsub.node_pubsub_mapping
+        assert channel not in old_ps.shard_channels
+        assert channel not in old_ps.pending_unsubscribe_shard_channels
 
     async def test_reinitialize_drops_old_pubsub_when_node_removed_from_topology(self):
         """
@@ -2777,3 +2784,303 @@ class TestClusterPubSubSlotMigration:
             and rec.levelno == logging.ERROR
             for rec in caplog.records
         )
+
+    def _make_stateful_node_pubsub(self, shard_channels=None):
+        """A per-node pubsub whose ``subscribed`` follows its channels.
+
+        ``_make_node_pubsub`` pins ``subscribed`` to True, which is what the
+        tests above need. The detach-driven garbage collection only becomes
+        observable when the flag tracks ``shard_channels`` the way a real
+        ``PubSub`` does, so those tests use this instead.
+        """
+        return _StatefulNodePubSub(shard_channels)
+
+    async def test_reinitialize_detaches_migrated_channel_from_old_pubsub(self):
+        """
+        Regression: a ``SUNSUBSCRIBE`` that never reaches the server used to
+        leave the channel in the old pubsub's ``shard_channels``.
+        ``PubSub.on_connect`` clears ``pending_unsubscribe_shard_channels`` and
+        replays ``SSUBSCRIBE`` from ``shard_channels``, so the channel was
+        re-subscribed on the node it had just been migrated away from on every
+        reconnect - and because the reverse index had already advanced,
+        reconciliation never revisited it. Delivery on that channel was lost
+        for the lifetime of the pubsub.
+        """
+        pubsub = self._make_cluster_pubsub()
+        old_node = self._make_node("127.0.0.1:7000")
+        new_node = self._make_node("127.0.0.1:7001")
+        migrated = b"foo"
+        staying = b"bar"
+        old_ps = self._make_stateful_node_pubsub({migrated: None, staying: None})
+        old_ps.sunsubscribe_error = ConnectionError("connection closed by server")
+        new_ps = self._make_stateful_node_pubsub()
+        pubsub.node_pubsub_mapping[old_node.name] = old_ps
+        pubsub.node_pubsub_mapping[new_node.name] = new_ps
+        pubsub.shard_channels = {migrated: None}
+        pubsub._shard_channel_to_node = {migrated: old_node.name}
+        pubsub.cluster.get_node_from_key.return_value = new_node
+        pubsub.cluster.get_node.return_value = old_node
+
+        await pubsub.reinitialize_shard_subscriptions()
+
+        # The channel is gone from the old node's replay set, and present on
+        # the new owner.
+        assert migrated not in old_ps.shard_channels
+        assert migrated not in old_ps.pending_unsubscribe_shard_channels
+        assert migrated in new_ps.shard_channels
+        assert pubsub._shard_channel_to_node[migrated] == new_node.name
+        # A sibling subscription on the same node is untouched, so the pubsub
+        # survives to recover it through on_connect.
+        assert staying in old_ps.shard_channels
+        assert old_node.name in pubsub.node_pubsub_mapping
+
+    async def test_reinitialize_collects_old_pubsub_once_detach_empties_it(self):
+        """
+        The end-of-pass garbage collection drops per-node pubsubs that hold no
+        subscription. Detaching the last channel of a node whose SUNSUBSCRIBE
+        failed must therefore release its dedicated connection instead of
+        leaving a pubsub the round-robin generator keeps polling for nothing.
+        """
+        pubsub = self._make_cluster_pubsub()
+        old_node = self._make_node("127.0.0.1:7000")
+        new_node = self._make_node("127.0.0.1:7001")
+        channel = b"foo"
+        old_ps = self._make_stateful_node_pubsub({channel: None})
+        old_ps.sunsubscribe_error = TimeoutError("timeout reading from socket")
+        new_ps = self._make_stateful_node_pubsub()
+        pubsub.node_pubsub_mapping[old_node.name] = old_ps
+        pubsub.node_pubsub_mapping[new_node.name] = new_ps
+        pubsub.shard_channels = {channel: None}
+        pubsub._shard_channel_to_node = {channel: old_node.name}
+        pubsub.cluster.get_node_from_key.return_value = new_node
+        pubsub.cluster.get_node.return_value = old_node
+
+        await pubsub.reinitialize_shard_subscriptions()
+
+        assert old_ps.aclose_calls == 1
+        assert old_node.name not in pubsub.node_pubsub_mapping
+        assert channel in new_ps.shard_channels
+
+    def _prime_generator(self, pubsub):
+        from redis.asyncio.cluster import ClusterPubSub
+
+        pubsub._pubsubs_generator = ClusterPubSub._pubsubs_generator(pubsub)
+
+    async def test_sharded_message_generator_skips_a_failing_pubsub(self):
+        """
+        Regression: a single reader serves every per-node pubsub, so letting an
+        exception from one abort the pass stopped delivery cluster-wide while
+        only one node was actually affected.
+        """
+        pubsub = self._make_cluster_pubsub()
+        bad = self._make_node_pubsub({b"foo": None})
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        good = self._make_node_pubsub({b"bar": None})
+        message = {"type": "smessage", "channel": b"bar", "data": b"hi"}
+        good.get_message.return_value = message
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": bad, "127.0.0.1:7001": good}
+        self._prime_generator(pubsub)
+
+        source, delivered = await pubsub._sharded_message_generator(timeout=0.01)
+
+        assert source is good
+        assert delivered is message
+
+    async def test_sharded_message_generator_raises_when_every_pubsub_fails(self):
+        """
+        Isolation must not swallow a total outage: with nothing left to poll
+        successfully, the first error is surfaced to the caller as before.
+        """
+        pubsub = self._make_cluster_pubsub()
+        first = self._make_node_pubsub({b"foo": None})
+        first.get_message.side_effect = ConnectionError("first is gone")
+        second = self._make_node_pubsub({b"bar": None})
+        second.get_message.side_effect = TimeoutError("second is slow")
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": first,
+            "127.0.0.1:7001": second,
+        }
+        self._prime_generator(pubsub)
+
+        with pytest.raises((ConnectionError, TimeoutError)):
+            await pubsub._sharded_message_generator(timeout=0.01)
+
+    async def test_sharded_message_generator_repairs_moved(self):
+        """
+        ``on_connect`` replays ``SSUBSCRIBE`` to the node its connection is
+        bound to, so a channel left on a former owner is answered with
+        ``MOVED``. ``MovedError`` is not retried by ``Connection.retry`` and
+        nothing else on the read path refreshes the slots cache, so without
+        this repair the subscription could never recover.
+        """
+        from redis.crc import key_slot
+        from redis.exceptions import MovedError
+
+        pubsub = self._make_cluster_pubsub()
+        channel = b"foo"
+        slot = key_slot(channel)
+        stale = self._make_stateful_node_pubsub({channel: None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": stale}
+        pubsub.shard_channels = {channel: None}
+        pubsub._shard_channel_to_node = {channel: "127.0.0.1:7000"}
+        self._prime_generator(pubsub)
+        stale.get_message_error = MovedError(f"{slot} 127.0.0.1:7001")
+        pubsub.cluster.nodes_manager.move_slot = AsyncMock()
+        pubsub.on_slots_changed = AsyncMock()
+
+        source, delivered = await pubsub._sharded_message_generator(timeout=0.01)
+
+        assert (source, delivered) == (None, None)
+        # The stale subscription is dropped so on_connect stops replaying it,
+        # and its recorded owner is forgotten so reconciliation does not
+        # short-circuit on an already-advanced reverse index.
+        assert channel not in stale.shard_channels
+        assert channel not in pubsub._shard_channel_to_node
+        # The channel stays in the cluster-level intent, which is what
+        # reconciliation walks.
+        assert channel in pubsub.shard_channels
+        pubsub.cluster.nodes_manager.move_slot.assert_awaited_once()
+        pubsub.on_slots_changed.assert_awaited_once()
+        # Cooled off, so an uncorrectable slots cache cannot make the repair
+        # re-run on every poll.
+        assert stale in pubsub._poll_cool_off
+
+    async def test_sharded_message_generator_survives_a_failing_redirect(self):
+        """
+        ``move_slot`` indexes ``slots_cache`` by the redirected slot, so an
+        as-yet-uncovered slot raises. That must not turn a pubsub read into an
+        exception: reconciliation is scheduled either way.
+        """
+        from redis.crc import key_slot
+        from redis.exceptions import MovedError
+
+        pubsub = self._make_cluster_pubsub()
+        channel = b"foo"
+        stale = self._make_stateful_node_pubsub({channel: None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": stale}
+        pubsub.shard_channels = {channel: None}
+        pubsub._shard_channel_to_node = {channel: "127.0.0.1:7000"}
+        self._prime_generator(pubsub)
+        stale.get_message_error = MovedError(f"{key_slot(channel)} 127.0.0.1:7001")
+        pubsub.cluster.nodes_manager.move_slot = AsyncMock(
+            side_effect=KeyError(key_slot(channel))
+        )
+        pubsub.on_slots_changed = AsyncMock()
+
+        assert await pubsub._sharded_message_generator(timeout=0.01) == (None, None)
+
+        pubsub.on_slots_changed.assert_awaited_once()
+
+    async def test_pubsubs_generator_survives_a_momentarily_empty_mapping(self):
+        """
+        Regression: the generator used to ``return`` on an empty
+        ``node_pubsub_mapping``, which exhausts it for good - and only
+        ``reset`` recreates it. Reconciliation drops a per-node pubsub before
+        creating its replacement, so one such window silently ended sharded
+        delivery for the rest of the pubsub's life.
+        """
+        pubsub = self._make_cluster_pubsub()
+        self._prime_generator(pubsub)
+
+        assert next(pubsub._pubsubs_generator) is None
+
+        ps = self._make_node_pubsub({b"foo": None})
+        pubsub.node_pubsub_mapping["127.0.0.1:7000"] = ps
+
+        assert next(pubsub._pubsubs_generator) is ps
+
+    async def test_sharded_message_generator_cools_off_a_failing_pubsub(self):
+        """
+        ``PubSub._execute`` reconnects and then retries through the
+        connection's own ``Retry``, so one "bounded" poll on an unreachable node
+        can cost its whole retry budget instead of the timeout the caller asked
+        for. Going straight back to that node on the next pass is what turns one
+        sick node into a cluster-wide delivery stall, so it is skipped for a
+        cool-off window while its healthy siblings keep being polled.
+        """
+        from redis.asyncio.cluster import SHARD_POLL_COOL_OFF_SECONDS
+
+        pubsub = self._make_cluster_pubsub()
+        bad = self._make_node_pubsub({b"foo": None})
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        good = self._make_node_pubsub({b"bar": None})
+        good.get_message.return_value = None
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": bad, "127.0.0.1:7001": good}
+        self._prime_generator(pubsub)
+
+        assert await pubsub._sharded_message_generator(timeout=0.01) == (None, None)
+        assert bad.get_message.await_count == 1
+        polls_of_good = good.get_message.await_count
+
+        # Second pass: the bad one is skipped, the good one is polled again.
+        assert await pubsub._sharded_message_generator(timeout=0.01) == (None, None)
+        assert bad.get_message.await_count == 1
+        assert good.get_message.await_count > polls_of_good
+
+        # Once the window expires it is tried again.
+        pubsub._poll_cool_off[bad] = time.monotonic() - SHARD_POLL_COOL_OFF_SECONDS
+        assert await pubsub._sharded_message_generator(timeout=0.01) == (None, None)
+        assert bad.get_message.await_count == 2
+
+    async def test_sharded_message_generator_clears_cool_off_on_success(self):
+        """A pubsub that polls cleanly must not stay in cool-off."""
+        pubsub = self._make_cluster_pubsub()
+        ps = self._make_node_pubsub({b"foo": None})
+        ps.get_message.return_value = None
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": ps}
+        self._prime_generator(pubsub)
+        pubsub._poll_cool_off[ps] = time.monotonic() - 1
+
+        await pubsub._sharded_message_generator(timeout=0.01)
+
+        assert ps not in pubsub._poll_cool_off
+
+
+class _StatefulNodePubSub:
+    """Per-node ``PubSub`` stand-in with real subscription state.
+
+    Only the surface ``ClusterPubSub`` touches on a per-node pubsub is
+    implemented: the subscription dicts, the ``subscribed`` flag derived from
+    them, and the three wire calls. ``sunsubscribe_error`` /
+    ``get_message_error`` inject the transient failures the tests are about.
+    """
+
+    def __init__(self, shard_channels=None):
+        self.shard_channels = dict(shard_channels or {})
+        self.pending_unsubscribe_shard_channels = set()
+        self.channels = {}
+        self.patterns = {}
+        self.subscribed_event = asyncio.Event()
+        if self.shard_channels:
+            self.subscribed_event.set()
+        self.sunsubscribe_error = None
+        self.get_message_error = None
+        self.aclose_calls = 0
+
+    @property
+    def subscribed(self):
+        return self.subscribed_event.is_set()
+
+    async def ssubscribe(self, *args):
+        for arg in args:
+            name = getattr(arg, "name", arg)
+            self.shard_channels[name] = getattr(arg, "handler", None)
+        self.subscribed_event.set()
+
+    async def sunsubscribe(self, channel):
+        if self.sunsubscribe_error is not None:
+            raise self.sunsubscribe_error
+        self.shard_channels.pop(channel, None)
+        if not self.shard_channels:
+            self.subscribed_event.clear()
+
+    async def get_message(self, ignore_subscribe_messages=False, timeout=0.0):
+        if self.get_message_error is not None:
+            raise self.get_message_error
+        return None
+
+    async def aclose(self):
+        self.aclose_calls += 1
+        self.shard_channels.clear()
+        self.pending_unsubscribe_shard_channels.clear()
+        self.subscribed_event.clear()

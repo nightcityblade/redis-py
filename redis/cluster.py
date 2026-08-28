@@ -8,6 +8,7 @@ import weakref
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from copy import copy
 from enum import Enum
 from itertools import chain
@@ -3030,6 +3031,15 @@ class ClusterPubSubSlotsCacheListener(EventListenerInterface):
             )
 
 
+# How long a per-node sharded-pubsub connection is skipped by the round robin
+# after a failed poll. PubSub._execute reconnects and retries through the
+# connection's own Retry, so one poll on an unreachable node can cost its whole
+# retry budget rather than the timeout the caller asked for; a cool-off keeps
+# the single reader from spending every pass on that node while its healthy
+# siblings hold undelivered messages.
+SHARD_POLL_COOL_OFF_SECONDS = 1.0
+
+
 class ClusterPubSub(PubSub):
     """
     Wrapper for PubSub class.
@@ -3075,6 +3085,12 @@ class ClusterPubSub(PubSub):
         # route sunsubscribe calls and reconcile subscriptions after slot
         # migration / failover.
         self._shard_channel_to_node: dict = {}
+        # Per-node poll cool-off deadlines (monotonic). Weak-keyed so a
+        # per-node pubsub dropped from node_pubsub_mapping takes its entry with
+        # it instead of leaking one per migration.
+        self._poll_cool_off: "weakref.WeakKeyDictionary[PubSub, float]" = (
+            weakref.WeakKeyDictionary()
+        )
         # Dedicated lock for shard-subscription bookkeeping. Distinct from
         # PubSub.self._lock (which serializes wire I/O on the cluster-level
         # connection used by aclose / send_command / regular subscribe) so
@@ -3239,6 +3255,7 @@ class ClusterPubSub(PubSub):
             pubsub._resubscribe_shard_channels = MethodType(
                 ClusterPubSub._resubscribe_shard_channels, pubsub
             )
+            self._pubsub_io_lock(pubsub)
             self.node_pubsub_mapping[node.name] = pubsub
             return pubsub
 
@@ -3248,24 +3265,196 @@ class ClusterPubSub(PubSub):
                 return node_name
         return None
 
+    @staticmethod
+    def _pubsub_io_lock(pubsub) -> threading.RLock:
+        """Return the per-node pubsub's wire I/O lock, creating it on first use.
+
+        A per-node ``PubSub`` is read by whichever thread polls
+        ``get_sharded_message`` and written by the reconciliation worker
+        (``_migrate_shard_channel``) and by any caller of ``ssubscribe`` /
+        ``sunsubscribe``. ``PubSub`` guards writes with its own ``_lock``
+        (``PubSub.execute_command``) but reads take no lock at all, so without
+        this the reader can be inside ``read_response`` while another thread's
+        ``_execute`` disconnects and reconnects the same socket underneath it -
+        which loses the reply to the handshake and surfaces as a read timeout
+        followed by ``EBADF``.
+
+        Kept on the pubsub rather than in a dict keyed by node name so it
+        travels with the object through ``node_pubsub_mapping`` and cannot go
+        stale when a per-node pubsub is dropped and recreated.
+        """
+        lock = getattr(pubsub, "_shard_io_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            pubsub._shard_io_lock = lock
+        return lock
+
+    @staticmethod
+    def _detach_shard_channel(pubsub, channel) -> None:
+        """Forget a shard channel on a per-node pubsub without a wire round trip.
+
+        ``PubSub.sunsubscribe`` only records the intent in
+        ``pending_unsubscribe_shard_channels``; the channel leaves
+        ``shard_channels`` when the server confirmation is read. So if the
+        ``SUNSUBSCRIBE`` never reaches the server, ``on_connect`` clears the
+        pending set and replays ``SSUBSCRIBE`` for the channel - on the node it
+        is being migrated away from, on every reconnect. Once the caller has
+        decided the channel belongs to a different node, the local intent is
+        the only truth left, so drop it here.
+        """
+        pubsub.shard_channels.pop(channel, None)
+        pubsub.pending_unsubscribe_shard_channels.discard(channel)
+        if not pubsub.channels and not pubsub.patterns and not pubsub.shard_channels:
+            pubsub.subscribed_event.clear()
+
     def _sharded_message_generator(self, timeout=0.0):
+        first_error: Optional[BaseException] = None
+        polled = 0
+        failed = 0
         for _ in range(len(self.node_pubsub_mapping)):
             pubsub = next(self._pubsubs_generator)
-            # Don't pass ignore_subscribe_messages here - let get_sharded_message
-            # handle the filtering after processing subscription state changes
-            message = pubsub.get_message(
-                ignore_subscribe_messages=False, timeout=timeout
-            )
+            if pubsub is None:
+                # node_pubsub_mapping was emptied between the len() above and
+                # here; nothing left to poll in this pass.
+                break
+            if self._poll_cool_off and time.monotonic() < self._poll_cool_off.get(
+                pubsub, 0.0
+            ):
+                # In cool-off after a failed poll: skip it so the reader spends
+                # this pass on the nodes that can still deliver.
+                continue
+            polled += 1
+            try:
+                with self._poll_io_lock(pubsub, timeout):
+                    # Don't pass ignore_subscribe_messages here - let
+                    # get_sharded_message handle the filtering after processing
+                    # subscription state changes
+                    message = pubsub.get_message(
+                        ignore_subscribe_messages=False, timeout=timeout
+                    )
+            except MovedError as e:
+                # Handled, not failed: _handle_moved_on_read re-routes the
+                # offending channels and schedules reconciliation, so the next
+                # pass recovers. Re-raising a MovedError out of a pubsub read
+                # would only hand the caller an error it cannot act on. Still
+                # cool off: if the slots cache cannot be corrected the repair
+                # would otherwise re-run on every poll.
+                self._poll_cool_off[pubsub] = (
+                    time.monotonic() + SHARD_POLL_COOL_OFF_SECONDS
+                )
+                self._handle_moved_on_read(pubsub, e)
+                continue
+            except (ConnectionError, TimeoutError, OSError) as e:
+                # One unhealthy node must not starve its healthy siblings. A
+                # single reader serves every per-node pubsub, so aborting the
+                # pass here stops delivery cluster-wide for as long as this one
+                # node stays unreachable - even though the slots it no longer
+                # serves are the only ones affected. Keep polling the rest and
+                # surface an error only if nothing in the pass worked, the same
+                # made-progress rule reinitialize_shard_subscriptions applies.
+                failed += 1
+                if first_error is None:
+                    first_error = e
+                # Cool off before polling this one again. PubSub._execute
+                # reconnects and then retries through the connection's own
+                # Retry, so a single "bounded" poll on an unreachable node can
+                # cost its whole retry budget - far longer than the timeout the
+                # caller asked for. Without a cool-off the reader goes straight
+                # back to that node on the next pass and pays it again, which
+                # is what turns one sick node into a cluster-wide delivery
+                # stall.
+                self._poll_cool_off[pubsub] = (
+                    time.monotonic() + SHARD_POLL_COOL_OFF_SECONDS
+                )
+                if is_debug_log_enabled():
+                    logger.debug(
+                        "sharded pubsub poll failed on %s: %s: %s",
+                        self._find_node_name_for_pubsub(pubsub),
+                        type(e).__name__,
+                        e,
+                    )
+                continue
+            # Emptiness check first: this is the per-message hot path, and the
+            # weakref lookup a WeakKeyDictionary pop needs is pure overhead
+            # while no node is in cool-off, which is the normal case.
+            if self._poll_cool_off:
+                self._poll_cool_off.pop(pubsub, None)
             if message is not None:
                 return pubsub, message
+        if first_error is not None and failed == polled:
+            raise first_error
         return None, None
 
+    def _poll_io_lock(self, pubsub, timeout):
+        """Guard a per-node poll against concurrent writers on the same socket.
+
+        ``timeout=None`` means ``PubSub.get_message`` blocks indefinitely, so
+        holding the lock across it would block reconciliation for as long as no
+        message arrives. Such a caller drives the pubsub itself and gets the
+        pre-existing unguarded behaviour; every bounded poll - which is what
+        ``PubSubWorkerThread`` and ``ClusterPubSub``'s own callers use - is
+        serialized.
+        """
+        if timeout is None:
+            return nullcontext()
+        return self._pubsub_io_lock(pubsub)
+
+    def _handle_moved_on_read(self, pubsub, error: MovedError) -> None:
+        """Re-route shard channels pinned to a node that lost their slot.
+
+        ``PubSub.on_connect`` replays ``SSUBSCRIBE`` to the node its connection
+        is bound to, so after a slot migration that node answers ``MOVED``.
+        ``MovedError`` is not in ``Retry.supported_errors`` and no other code on
+        the read path refreshes the slots cache, so a shard channel left on a
+        former owner could never recover. Drop the offending channels from this
+        pubsub so the replay stops, forget their recorded owner so
+        ``reinitialize_shard_subscriptions`` does not short-circuit on an
+        already-advanced reverse index, then apply the redirect and reconcile.
+        """
+        node_name = self._find_node_name_for_pubsub(pubsub)
+        logger.debug(
+            "sharded pubsub: %s no longer owns slot %s; re-routing its shard channels",
+            node_name,
+            error.slot_id,
+        )
+        with self._shard_state_lock:
+            for channel in list(pubsub.shard_channels):
+                if key_slot(self.encoder.encode(channel)) != error.slot_id:
+                    continue
+                self._detach_shard_channel(pubsub, channel)
+                if self._shard_channel_to_node.get(channel) == node_name:
+                    del self._shard_channel_to_node[channel]
+        # move_slot applies the redirect to the slots cache and dispatches
+        # AfterSlotsCacheRefreshEvent, which reaches on_slots_changed. Call
+        # on_slots_changed unconditionally too: move_slot skips the dispatch on
+        # a circular MOVED, and a duplicate reconciliation pass is a no-op.
+        # move_slot indexes slots_cache by the redirected slot, so an
+        # as-yet-uncovered slot raises: log and still reconcile rather than let
+        # a repair attempt break a pubsub read.
+        try:
+            self.cluster.nodes_manager.move_slot(error)
+        except Exception as exc:
+            logger.debug(
+                "sharded pubsub: could not apply the redirect for slot %s: %s: %s",
+                error.slot_id,
+                type(exc).__name__,
+                exc,
+            )
+        self.on_slots_changed()
+
     def _pubsubs_generator(self):
+        # Never return: a generator that returns is exhausted for good and only
+        # reset() recreates this one, so a momentarily empty
+        # node_pubsub_mapping - reconciliation drops a per-node pubsub before
+        # creating its replacement - would stop the round robin permanently.
+        # Yield None for an empty mapping instead, which lets the caller skip
+        # the slot without this loop spinning on an empty list.
         while True:
             current_nodes = list(self.node_pubsub_mapping.values())
             if not current_nodes:
-                return  # Avoid infinite loop when no subscriptions exist
-            yield from current_nodes
+                yield None
+            else:
+                yield from current_nodes
 
     def get_sharded_message(
         self, ignore_subscribe_messages=False, timeout=0.0, target_node=None
@@ -3278,11 +3467,13 @@ class ClusterPubSub(PubSub):
             # KeyError. None pubsub falls through to "no message available".
             pubsub = self.node_pubsub_mapping.get(target_node.name)
             if pubsub is not None:
-                # Don't pass ignore_subscribe_messages here - let get_sharded_message
-                # handle the filtering after processing subscription state changes
-                message = pubsub.get_message(
-                    ignore_subscribe_messages=False, timeout=timeout
-                )
+                with self._poll_io_lock(pubsub, timeout):
+                    # Don't pass ignore_subscribe_messages here - let
+                    # get_sharded_message handle the filtering after processing
+                    # subscription state changes
+                    message = pubsub.get_message(
+                        ignore_subscribe_messages=False, timeout=timeout
+                    )
             else:
                 message = None
         else:
@@ -3318,7 +3509,8 @@ class ClusterPubSub(PubSub):
                     name = self._find_node_name_for_pubsub(pubsub)
                     if name is not None:
                         try:
-                            pubsub.reset()
+                            with self._pubsub_io_lock(pubsub):
+                                pubsub.reset()
                         except Exception:
                             pass
                         self.node_pubsub_mapping.pop(name, None)
@@ -3369,10 +3561,11 @@ class ClusterPubSub(PubSub):
                     )
                     continue
                 pubsub = self._get_node_pubsub(node)
-                if handler:
-                    pubsub.ssubscribe(Subscription(s_channel, handler))
-                else:
-                    pubsub.ssubscribe(s_channel)
+                with self._pubsub_io_lock(pubsub):
+                    if handler:
+                        pubsub.ssubscribe(Subscription(s_channel, handler))
+                    else:
+                        pubsub.ssubscribe(s_channel)
                 self.shard_channels.update(pubsub.shard_channels)
                 self._shard_channel_to_node[normalized_key] = node.name
                 self.pending_unsubscribe_shard_channels.difference_update(
@@ -3405,7 +3598,8 @@ class ClusterPubSub(PubSub):
                     if not node or node.name not in self.node_pubsub_mapping:
                         continue
                     p = self.node_pubsub_mapping[node.name]
-                p.sunsubscribe(s_channel)
+                with self._pubsub_io_lock(p):
+                    p.sunsubscribe(s_channel)
                 self.pending_unsubscribe_shard_channels.update(
                     p.pending_unsubscribe_shard_channels
                 )
@@ -3461,7 +3655,8 @@ class ClusterPubSub(PubSub):
             for name, pubsub in list(self.node_pubsub_mapping.items()):
                 if not pubsub.subscribed:
                     try:
-                        pubsub.reset()
+                        with self._pubsub_io_lock(pubsub):
+                            pubsub.reset()
                     except Exception:
                         pass
                     self.node_pubsub_mapping.pop(name, None)
@@ -3489,38 +3684,42 @@ class ClusterPubSub(PubSub):
         if old_name and old_name in self.node_pubsub_mapping:
             old_pubsub = self.node_pubsub_mapping[old_name]
             try:
-                old_pubsub.sunsubscribe(channel)
+                with self._pubsub_io_lock(old_pubsub):
+                    old_pubsub.sunsubscribe(channel)
             except (ConnectionError, TimeoutError, OSError):
                 # redis-py's Connection has already called ``disconnect()``
                 # before raising (see Connection.read_response /
-                # send_packed_command with ``disconnect_on_error=True``),
-                # so ``old_pubsub``'s dedicated socket is gone. Two cases:
-                #
-                # 1. The old node is no longer in the cluster topology
-                #    (e.g. removed by failover / topology refresh): no
-                #    reconnect target exists, so ``old_pubsub.subscribed``
-                #    would stay True forever and the end-of-pass GC block
-                #    would skip it. Drop it eagerly so the round-robin
-                #    generator does not keep yielding a dead pubsub that
-                #    produces periodic errors from ``get_sharded_message``.
-                # 2. The old node is still known (transiently slow /
-                #    unreachable): ``PubSub._execute`` auto-reconnects and
-                #    ``on_connect`` re-subscribes to remaining channels,
-                #    so other subscriptions on the same pubsub recover
-                #    naturally. Leave it alone.
+                # send_packed_command with ``disconnect_on_error=True``), so
+                # ``old_pubsub``'s dedicated socket is gone and the
+                # ``SUNSUBSCRIBE`` never reached the server. Forget the channel
+                # locally: the reverse index below advances to the new owner, so
+                # reconciliation will never revisit this channel, while
+                # ``on_connect`` would keep replaying ``SSUBSCRIBE`` for it to
+                # this very node on every reconnect - the server would answer
+                # ``MOVED`` and the subscription would never work again.
+                self._detach_shard_channel(old_pubsub, channel)
+                # If the old node has left the cluster topology there is no
+                # reconnect target, so drop the pubsub eagerly rather than let
+                # the round-robin generator keep yielding a dead one. If it is
+                # still known, the end-of-pass GC collects it once the detach
+                # above has left it with no subscriptions, and any sibling
+                # subscription it still holds recovers through
+                # ``PubSub._execute``'s reconnect and ``on_connect`` replay.
                 if self.cluster.get_node(node_name=old_name) is None:
                     try:
-                        old_pubsub.reset()
+                        with self._pubsub_io_lock(old_pubsub):
+                            old_pubsub.reset()
                     except Exception:
                         pass
                     self.node_pubsub_mapping.pop(old_name, None)
         # Attach to the new per-node pubsub, preserving the handler. Decode to
         # a text key only when we must pass it as a kwarg (handler present).
         new_pubsub = self._get_node_pubsub(new_node)
-        if handler:
-            new_pubsub.ssubscribe(Subscription(channel, handler))
-        else:
-            new_pubsub.ssubscribe(channel)
+        with self._pubsub_io_lock(new_pubsub):
+            if handler:
+                new_pubsub.ssubscribe(Subscription(channel, handler))
+            else:
+                new_pubsub.ssubscribe(channel)
         self.shard_channels.update(new_pubsub.shard_channels)
         normalized_key = next(iter(self._normalize_keys({channel: None})))
         self._shard_channel_to_node[normalized_key] = new_node.name
